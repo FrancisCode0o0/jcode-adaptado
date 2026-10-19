@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -73,6 +74,24 @@ class FakeClient:
         return item
 
 
+# ------------------------------------------------------------- Fake clock
+class FakeTime:
+    """Stands in for the time module inside jcode only: sleep() records the
+    delay instead of waiting, everything else is the real time module.
+
+    Patching time.sleep globally would also catch the standard library's own
+    sleeps (subprocess.Popen.wait with a timeout polls with time.sleep while
+    the git check waits for git to exit), so the recorded delays would depend
+    on how fast git exits on the machine running the tests.
+    """
+
+    def __init__(self, sleeps: list[float]) -> None:
+        self.sleep = sleeps.append
+
+    def __getattr__(self, name: str):
+        return getattr(time, name)
+
+
 # ------------------------------------------------------------------ Fixture
 @pytest.fixture
 def jc(tmp_path, monkeypatch):
@@ -102,7 +121,7 @@ def jc(tmp_path, monkeypatch):
     monkeypatch.setattr(jcode, "FALLBACK", jcode_extras.FallbackChain(chain, day_fn=lambda: day["value"]))
     monkeypatch.setattr(jcode, "ACTIVE_ENTRY", None)
     monkeypatch.setattr(jcode, "_AUTO_SWITCHED", False)
-    monkeypatch.setattr(jcode.time, "sleep", sleeps.append)
+    monkeypatch.setattr(jcode, "time", FakeTime(sleeps))  # only jcode's sleeps
     jcode._activate_entry(chain[0])
 
     return SimpleNamespace(mod=jcode, fake=fake, sandbox=sandbox.resolve(), chain=chain,
