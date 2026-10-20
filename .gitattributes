@@ -1,0 +1,4 @@
+# Shell scripts and git hooks must keep LF line endings, also in the Windows
+# working copy: with CRLF, sh fails on "$'\r': command not found".
+*.sh               text eol=lf
+.githooks/*        text eol=lf

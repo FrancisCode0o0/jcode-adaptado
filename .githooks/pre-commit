@@ -1,0 +1,25 @@
+#!/bin/sh
+# Git pre-commit hook: refuse the commit if the staged changes add something
+# that looks like an API key, token or private key (tools/check_secrets.py).
+#
+# Activate once per clone, from the repository root:
+#     git config core.hooksPath .githooks
+#
+# Fails closed: if no Python interpreter is found the commit is refused,
+# because a silent skip would look exactly like a passed check.
+
+repo_root=$(git rev-parse --show-toplevel) || exit 2
+checker="$repo_root/tools/check_secrets.py"
+
+# Windows first ("py" launcher), then Linux names. Each candidate is tried
+# for real, because on Windows "python3" can be a Store stub that only
+# prints an install message.
+for candidate in "py -3" "python3" "python"; do
+    if $candidate -c "import sys" >/dev/null 2>&1; then
+        exec $candidate "$checker" --staged
+    fi
+done
+
+echo "pre-commit: no Python found, so the secret check could not run." >&2
+echo "Commit refused. Install Python or ask Claude before retrying." >&2
+exit 1
