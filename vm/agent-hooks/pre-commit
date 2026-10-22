@@ -1,0 +1,17 @@
+#!/bin/sh
+# Trusted commit hook for the Abschrift clones in the VM (Fran commits the
+# acceptance tests in the verifier clone). vm/setup_abschrift.sh points the
+# clone's core.hooksPath HERE, outside every cell: no agent can see or change
+# this file, unlike a hook inside the clone (.githooks/ is part of the work
+# tree the agents write).
+#
+# Runs jcode-adaptado's own tools/check_secrets.py (not the clone's copy, for
+# the same reason). Fails closed: no Python -> no commit.
+checker="$(dirname "$0")/../../tools/check_secrets.py"
+for candidate in python3 python; do
+    if command -v "$candidate" >/dev/null 2>&1 && "$candidate" -c "import sys" >/dev/null 2>&1; then
+        exec "$candidate" -I "$checker" --staged
+    fi
+done
+echo "pre-commit: no Python found, so the secret check could not run. Commit refused." >&2
+exit 1

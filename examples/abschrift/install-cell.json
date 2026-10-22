@@ -1,0 +1,20 @@
+{
+  "_comment": "Cell for installations of Abschrift (Gemini CLI, npm packages of the repo, its Playwright browsers). npm runs install scripts of every package; here they see only the target folder, the npm cache and the browser folder of Abschrift - no key, no other project, our Node read-only. Used by vm/setup_abschrift.sh and vm/abschrift/npm_install.sh.",
+  "sandbox": {
+    "enabled": true,
+    "required": true,
+    "read_only": ["~/.local/opt/node"],
+    "read_write": ["~/.cache/npm-abschrift", "~/.cache/ms-playwright-abschrift"],
+    "git_read_only": true,
+    "env": {
+      "npm_config_cache": "~/.cache/npm-abschrift",
+      "npm_config_update_notifier": "false",
+      "npm_config_fund": "false",
+      "npm_config_audit": "false",
+      "PLAYWRIGHT_BROWSERS_PATH": "~/.cache/ms-playwright-abschrift"
+    },
+    "expect_absent": ["~/.bashrc", "~/.ssh", "~/.gemini", "~/jcode-adaptado", "~/repos",
+                      "/mnt/datos", "~/venv-audio", "~/.cache/ms-playwright"]
+  },
+  "env_passthrough": []
+}

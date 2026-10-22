@@ -7,6 +7,16 @@
   },
   "compact_threshold_tokens": 60000,
   "max_command_timeout_s": 14400,
+  "env_passthrough": ["KAGGLE_KEY", "KAGGLE_API_TOKEN"],
+  "sandbox": {
+    "_comment": "Cell for run_command (jcode 0.10.0-ma.3). OFF until plan step 1.0.e switches it on and tests it (Chromium, Firefox and WebKit inside). With it on, only code/ is writable and its .git read-only; Node, the Playwright browsers, venv-audio and /mnt/datos are read-only; the home folder is empty.",
+    "enabled": false,
+    "read_only": ["~/.local/opt/node", "~/.cache/ms-playwright", "~/venv-audio", "/mnt/datos"],
+    "git_read_only": true,
+    "expect_absent": ["~/.bashrc", "~/.ssh", "~/.gemini", "~/abschrift-gemini", "~/repos",
+                      "~/jcode-projekte", "~/jcode-adaptado/jcode.py",
+                      "~/jcode-adaptado/settings.json", "~/jcode-adaptado/vm"]
+  },
   "model_fallback": [
     { "provider": "gemini", "model": "gemini-3.5-flash-lite", "reasoning_effort": "low" },
     { "provider": "gemini", "model": "gemini-3.8-flash", "reasoning_effort": "low" },

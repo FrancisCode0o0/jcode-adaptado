@@ -1,0 +1,40 @@
+{
+  "_comment": "jcode settings for Abschrift (vm/setup_abschrift.sh copies it to ~/jcode-projekte/abschrift/settings.json). Budget 0 EUR: both models free as of 2026-10-20 (OpenCode Zen live model list; NVIDIA build.nvidia.com, phone verification, no card). Never Google models here: the builder is Gemini. Keys only as environment variables.",
+  "default_mode": "verifier",
+  "modes": {
+    "executor": { "max_steps": 15 },
+    "builder": { "max_steps": 40 },
+    "verifier": { "max_steps": 30, "write_paths": ["tests/acceptance/", "reports/"] }
+  },
+  "compact_threshold_tokens": 60000,
+  "max_command_timeout_s": 3600,
+  "fallback_exhausted": "stop",
+  "env_passthrough": [],
+  "sandbox": {
+    "_comment": "Required (Abschrift plan v12, E7, A1, A5, A8): without a working cell jcode does not start. Inside: only code/ writable (node_modules, test-results), code/.git read-only, Node and ~/.cache/ms-playwright-abschrift read-only, /tmp empty; no ~/.bashrc, no other project, no /mnt/datos, no API key.",
+    "enabled": true,
+    "required": true,
+    "read_only": ["~/.local/opt/node", "~/.cache/ms-playwright-abschrift"],
+    "git_read_only": true,
+    "env": { "PLAYWRIGHT_BROWSERS_PATH": "~/.cache/ms-playwright-abschrift" },
+    "expect_absent": ["~/.bashrc", "~/.ssh", "~/.gemini", "~/abschrift-gemini", "~/repos",
+                      "/mnt/datos", "~/jcode-adaptado", "~/venv-audio", "~/.cache/ms-playwright",
+                      "~/jcode-projekte/abschrift/settings.json", "~/jcode-projekte/abschrift/logs"]
+  },
+  "model_fallback": [
+    { "provider": "opencode-zen", "model": "deepseek-v4.1-flash-free", "reasoning_effort": null },
+    { "provider": "nvidia", "model": "deepseek-ai/deepseek-v4.1-flash", "reasoning_effort": null }
+  ],
+  "providers": {
+    "opencode-zen": {
+      "base_url": "https://opencode.ai/zen/v1",
+      "api_key_env": "OPENCODE_API_KEY",
+      "model": "deepseek-v4.1-flash-free"
+    },
+    "nvidia": {
+      "base_url": "https://integrate.api.nvidia.com/v1",
+      "api_key_env": "NVIDIA_API_KEY",
+      "model": "deepseek-ai/deepseek-v4.1-flash"
+    }
+  }
+}

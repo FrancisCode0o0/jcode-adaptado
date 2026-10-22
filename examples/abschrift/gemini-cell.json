@@ -1,0 +1,19 @@
+{
+  "_comment": "Cell of Gemini CLI for Abschrift (Abschrift plan v12: E5, A5, A9). Used only by vm/abschrift/start_gemini.sh; never start gemini without it. Gemini CLI writes its clone (except tests/acceptance/, read-only) and ~/.gemini; it sees no other project, no ~/.bashrc and no API key (so it logs in with the AI Pro account, not with GEMINI_API_KEY). Login without a browser: NO_BROWSER=true prints a URL; open it on any device and paste the code back.",
+  "sandbox": {
+    "enabled": true,
+    "required": true,
+    "interactive": true,
+    "read_only": ["~/.local/opt/node", "~/.local/opt/gemini-cli", "~/.cache/ms-playwright-abschrift"],
+    "read_write": ["~/.gemini"],
+    "read_only_in_workdir": ["tests/acceptance"],
+    "git_read_only": false,
+    "env": {
+      "NO_BROWSER": "true",
+      "PLAYWRIGHT_BROWSERS_PATH": "~/.cache/ms-playwright-abschrift"
+    },
+    "expect_absent": ["~/.bashrc", "~/.ssh", "~/jcode-projekte", "~/repos", "~/jcode-adaptado",
+                      "/mnt/datos", "~/venv-audio", "~/.cache/ms-playwright"]
+  },
+  "env_passthrough": []
+}

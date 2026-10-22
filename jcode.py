@@ -1,20 +1,26 @@
 #!/usr/bin/env python3
 # MIT License - Copyright (c) 2026 Prof. Dr. Joern Fischer (full text: see README.md)
-# Adapted for the mejorador-audio project (c) 2026 Francis Garcia Reyes, same license.
+# Adapted for the mejorador-audio and Abschrift projects (c) 2026 Francis Garcia Reyes,
+# same license.
 """jcode - minimal coding agent for local LLMs, sandboxed to ./code.
 Setup, usage and configuration: see README.md.
 
 This fork (based on the 'multimodal' branch, commit b37d004cb7) adds an
 'executor' mode, automatic model fallback on exhausted daily quotas,
-settings.json-driven limits and a git check after every task. Every change
-is marked with 'FORK:' and listed in README.md; the new logic itself lives
-in jcode_extras.py."""
+settings.json-driven limits and a git check after every task; for Abschrift
+also '--project <folder>', a 'verifier' mode, 'fallback_exhausted: stop' and
+a run_command environment without secrets; for both projects an optional
+bubblewrap cell for run_command ("sandbox" in settings.json, 0.10.0-ma.3,
+module jcode_cell.py). Every change is marked with
+'FORK:' and listed in README.md; the new logic itself lives in
+jcode_extras.py."""
 
 import difflib
 import inspect
 import json
 import os
 import re
+import shutil  # FORK (E7): find bwrap
 import subprocess
 import sys
 import time
@@ -32,15 +38,20 @@ from pathlib import Path
 
 from openai import OpenAI
 
-from jcode_extras import (  # FORK: additions for mejorador-audio
-    BUILDER, EXECUTOR, EXECUTOR_PROMPT, EXECUTOR_TOOL_NAMES, REPORTS_DIR_NAME,
-    FallbackChain, classify_rate_limit, git_changes, is_under_reports,
-    load_config, resolve_mode, retry_delay_seconds,
+from jcode_extras import (  # FORK: additions for mejorador-audio and Abschrift
+    BUILDER, EXECUTOR, EXECUTOR_PROMPT, EXECUTOR_TOOL_NAMES, FALLBACK_STOP,
+    REPORTS_DIR_NAME, SETTINGS_FILE_NAME, VERIFIER, VERIFIER_TOOL_NAMES,
+    FallbackChain, classify_rate_limit, git_changes, is_under_any,
+    load_config, parse_cli_args, resolve_mode, retry_delay_seconds,
+    sanitized_env, verifier_prompt,
+)
+from jcode_cell import (  # FORK (E7): run_command inside a bubblewrap cell
+    LAUNCH_ENV, CellError, build_argv, check_cell, parse_cell_config,
 )
 
 # --------------------------------------------------------------- Configuration
 APP_NAME = "jcode"
-APP_VERSION = "0.10.0-ma.1"  # FORK: upstream 0.10.0 + mejorador-audio adaptation 1
+APP_VERSION = "0.10.0-ma.3"  # FORK: upstream 0.10.0 + adaptation 3 (mejorador-audio, Abschrift)
 DEFAULT_MODEL = "qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive"
 MODEL = DEFAULT_MODEL
 
@@ -71,7 +82,16 @@ def _pick_model(models: list[str]) -> str:
 # FORK: settings.json, ./code and the logs are looked up next to jcode.py
 # instead of in the current directory, so jcode works from any folder.
 APP_DIR = Path(__file__).resolve().parent
-SETTINGS_FILE = APP_DIR / "settings.json"
+# FORK (E1): 'jcode.py --project <folder> [task]' takes settings.json, code/
+# and logs/ from <folder>; without the option everything stays next to
+# jcode.py (mejorador-audio). A wrong --project stops jcode at once instead
+# of silently running on the other project's settings.
+PROJECT_DIR, CLI_TASK, _CLI_ERROR = parse_cli_args(sys.argv[1:])
+if _CLI_ERROR:
+    print(f"ERROR: {_CLI_ERROR}", file=sys.stderr)
+    sys.exit(2)
+BASE_DIR = PROJECT_DIR or APP_DIR
+SETTINGS_FILE = BASE_DIR / SETTINGS_FILE_NAME
 def _load_settings() -> dict:
     """Reads settings.json: providers (OpenAI/Anthropic/Gemini via OpenAI-compatible endpoints) for '/backend <name>'."""
     try:
@@ -80,7 +100,11 @@ def _load_settings() -> dict:
         print(f"WARNING: settings.json ignored ({e})", file=sys.stderr); return {}
 SETTINGS = _load_settings()
 CONFIG, _CONFIG_WARNINGS = load_config(SETTINGS)  # FORK: new settings.json keys
-for _w in _CONFIG_WARNINGS:
+# FORK (E7): "sandbox" section - run_command inside a bubblewrap cell.
+_CELL_WARNINGS: list[str] = []
+CELL = parse_cell_config(SETTINGS.get("sandbox"), _CELL_WARNINGS)
+_BWRAP = shutil.which("bwrap") or "bwrap"
+for _w in _CONFIG_WARNINGS + _CELL_WARNINGS:
     print(f"WARNING: settings.json: {_w}", file=sys.stderr)
 
 def _detect_backend() -> tuple[str, str, str]:
@@ -128,7 +152,7 @@ def _switch_backend(name: str) -> None:
     client = OpenAI(base_url=BASE_URL, api_key=_API_KEY, timeout=REQUEST_TIMEOUT, max_retries=0)
     print(f"{DIM}Backend: {BACKEND} ({BASE_URL}) | Model: {MODEL}{RESET}")
 
-SANDBOX = (APP_DIR / "code").resolve()  # FORK: next to jcode.py (was ./code)
+SANDBOX = (BASE_DIR / "code").resolve()  # FORK: next to jcode.py or in --project (was ./code)
 # FORK: the active mode and its step limit come from settings.json
 # (executor 15, builder 40 by default); /mode and /max-turns change them.
 MODE = CONFIG.default_mode
@@ -141,9 +165,10 @@ KEEP_RECENT = 8               # most recent messages kept uncompressed
 REQUEST_TIMEOUT = 11600         # seconds per LLM request (local models are slow)
 RETRY_WAITS = (5, 15, 30, 60)  # wait times between retry attempts
 REASONING_EFFORT = None  # None = backend default; else "high"|"medium"|"low"|"max"|"none" (Ollama /v1)
-# FORK: one log per session in logs/ next to jcode.py - outside the sandbox,
-# so the agent cannot overwrite it and git status in ./code stays clean.
-LOG_DIR = APP_DIR / "logs"
+# FORK: one log per session in logs/ next to jcode.py (or in --project) -
+# outside the sandbox, so the agent cannot overwrite it and git status in
+# ./code stays clean.
+LOG_DIR = BASE_DIR / "logs"
 LOG_FILE = LOG_DIR / "jcode-session.md"  # replaced by a dated name in new_session()
 _REQ_NR = 0  # running number of LM Studio requests
 
@@ -211,8 +236,16 @@ SYSTEM_PROMPT = (
     "tests are green."
 )
 # FORK: the original prompt above is the builder prompt; executor mode gets
-# its own (run, read, diagnose, report - never fix).
+# its own (run, read, diagnose, report - never fix), verifier mode too
+# (acceptance tests and reviews, with the exit answer "KEINE FEHLER").
 MODE_PROMPTS = {BUILDER: SYSTEM_PROMPT, EXECUTOR: EXECUTOR_PROMPT}
+
+def _mode_prompt() -> str:
+    """FORK: system prompt of the active mode; the verifier prompt names the
+    write_paths from settings.json, so it is built when a session starts."""
+    if MODE == VERIFIER:
+        return verifier_prompt(CONFIG.verifier_write_paths)
+    return MODE_PROMPTS[MODE]
 
 # ----------------------------------------------------------------- Path sandbox
 def _resolve(rel_path: str) -> Path:
@@ -237,6 +270,8 @@ def list_files(subdir: str = ".") -> str:
         return f"'{subdir}' does not exist."
     items = []
     for p in sorted(base.rglob("*")):
+        if not _inside_sandbox(p):  # FORK (security): no peeking through symlinks
+            continue
         tag = "[dir] " if p.is_dir() else "      "
         items.append(tag + str(p.relative_to(SANDBOX)))
     return "\n".join(items) or "(empty)"
@@ -252,14 +287,26 @@ def read_file(path: str, numbered: bool = False) -> str:
         )
     return text
 
+def _inside_sandbox(path: Path) -> bool:
+    """FORK (security): True if the path, after following symlinks, is in the sandbox."""
+    real = path.resolve()
+    return real == SANDBOX or SANDBOX in real.parents
+
 def search_files(pattern: str, glob: str = "**/*") -> str:
     """Regex search over all sandbox files; hits as 'file:line: content'."""
     try:
         rx = re.compile(pattern)
     except re.error as e:
         return f"ERROR: invalid regex: {e}"
+    # FORK (security): the original followed '..' in the glob and symlinks
+    # out of code/ - one call could send ~/.bashrc (with the API key) to the
+    # model. Only files that really lie inside the sandbox are read now.
+    if ".." in Path(glob).parts:
+        return "ERROR: '..' is not allowed in glob - it would leave the sandbox."
     hits = []
     for p in sorted(SANDBOX.glob(glob.lstrip("/") or "**/*")):
+        if not _inside_sandbox(p):
+            continue
         try:
             text = p.read_text(encoding="utf-8") if p.is_file() else ""
         except (UnicodeDecodeError, OSError):
@@ -315,9 +362,13 @@ def _print_diff(old: str, new: str, path: str) -> None:
 
 def write_file(path: str, content: str) -> str:
     p = _resolve(path)
-    if MODE == EXECUTOR and not is_under_reports(p, SANDBOX):  # FORK: write guard
-        return (f"ERROR: in executor mode write_file may only write under "
-                f"{REPORTS_DIR_NAME}/ - '{path}' was refused, nothing written.")
+    # FORK: write guard - executor only under reports/, verifier only under
+    # the write_paths of settings.json, builder anywhere (as the original).
+    allowed = CONFIG.write_dirs(MODE)
+    if allowed is not None and not is_under_any(p, SANDBOX, allowed):
+        folders = ", ".join(f"{d}/" for d in allowed)
+        return (f"ERROR: in {MODE} mode write_file may only write under "
+                f"{folders} - '{path}' was refused, nothing written.")
     p.parent.mkdir(parents=True, exist_ok=True)
     old = p.read_text(encoding="utf-8") if p.is_file() else None
     p.write_text(content, encoding="utf-8")
@@ -428,13 +479,18 @@ def run_command(command: str, timeout: int = CMD_TIMEOUT) -> str:
     command = re.sub(r"^\s*pip3?\b", f"{sys.executable} -m pip", command)
     timeout = max(1, min(int(timeout), MAX_CMD_TIMEOUT))  # FORK: cap from settings.json
     try:
+        args, shell, env = _command_process(command)  # FORK (E7): cell if enabled
+    except CellError as e:
+        return f"ERROR: cell: {e} - nothing was run."
+    try:
         proc = subprocess.run(
-            command,
-            shell=True,
+            args,
+            shell=shell,
             cwd=SANDBOX,
             capture_output=True,
             text=True,
             timeout=timeout,
+            env=env,  # FORK (E4): no API keys in the shell
         )
     except subprocess.TimeoutExpired:
         return f"TIMEOUT after {timeout}s: {command!r}"
@@ -443,6 +499,54 @@ def run_command(command: str, timeout: int = CMD_TIMEOUT) -> str:
     if len(out) > 4000:  # save context
         out = out[:2000] + "\n...[truncated]...\n" + out[-2000:]
     return f"exit_code={proc.returncode}\n{out}"
+
+def _command_env() -> dict:
+    """FORK (E4): jcode's environment minus every variable whose name contains
+    KEY, TOKEN, SECRET (and similar), except env_passthrough in settings.json.
+    Built per call, so variables exported later are filtered too."""
+    return sanitized_env(os.environ, CONFIG.env_passthrough)[0]
+
+def _command_process(command: str) -> tuple:
+    """FORK (E7): (args, shell, env) for subprocess.run. Without a cell as
+    before: /bin/sh -c in code/ with the E4 environment. With a cell:
+    bwrap ... -- /bin/sh -c <command>; inside, only the cell's short variable
+    list (taken from the E4 environment); bwrap itself starts with LAUNCH_ENV
+    (it is process 1 in the cell and its environment is readable there).
+    The cell has its own PID namespace, so a timeout also ends every
+    process the command left running in the background."""
+    if not CELL.enabled:
+        return command, True, _command_env()
+    argv, _notes = build_argv(CELL, command=["/bin/sh", "-c", command], workdir=SANDBOX,
+                              environ=_command_env(), passthrough=CONFIG.env_passthrough,
+                              bwrap=_BWRAP)
+    return argv, False, dict(LAUNCH_ENV)
+
+def _cell_ready() -> bool:
+    """FORK (E7): with "sandbox": {"enabled": true} jcode starts only if the
+    cell really works (checked from inside, like vm/session_check.sh does);
+    "required": true (Abschrift) also refuses "enabled": false."""
+    if not CELL.enabled:
+        if CELL.required:
+            print(f"{RED}\u2717 settings.json: sandbox.required is true but sandbox.enabled is "
+                  f"false - jcode does not start without its cell.{RESET}", file=sys.stderr)
+            return False
+        return True
+    results = check_cell(CELL, workdir=SANDBOX, environ=_command_env(),
+                         passthrough=CONFIG.env_passthrough, bwrap=_BWRAP)
+    failed = [text for level, text in results if level != "OK"]
+    for text in failed:
+        print(f"{RED}\u2717 cell: {text}{RESET}", file=sys.stderr)
+    if failed:
+        print(f"{RED}\u2717 sandbox.enabled is true and the cell does not work - jcode does "
+              f"not start (bash vm/session_check.sh shows the details).{RESET}", file=sys.stderr)
+    return not failed
+
+def _cell_note() -> str:
+    """FORK (E7): one line for the start screen."""
+    if not CELL.enabled:
+        return "off (run_command sees the whole home folder)"
+    return (f"ON (bubblewrap): only code/ writable, {len(CELL.read_only)} read-only "
+            f"path(s), empty home folder")
 
 def web_search(query: str, max_results: int = 5) -> str:
     """Web search via DuckDuckGo; returns title, URL and snippet of the hits."""
@@ -759,6 +863,10 @@ _TOOL_META = {
             "(e.g. 'pip install requests', 'npm install lodash'). "
             "Destructive commands (rm -rf /, sudo, dd, mkfs, shutdown, ...) "
             "are blocked."
+            # FORK (E7): tell the model what the cell means for it.
+            + (" The command runs in an isolated cell: only the 'code' directory "
+               "is writable, the home folder is empty and nothing can be installed "
+               "outside 'code'." if CELL.enabled else "")
         ),
         # FORK: the original said 'default 30' while the real default is
         # CMD_TIMEOUT; long project scripts need an explicit long timeout.
@@ -844,7 +952,11 @@ TOOLS = [_build_tool_schema(fn) for fn in TOOL_FUNCS.values()]
 
 def _active_tool_names() -> tuple[str, ...]:
     """FORK: tools the model may use in the current mode."""
-    return EXECUTOR_TOOL_NAMES if MODE == EXECUTOR else tuple(TOOL_FUNCS)
+    if MODE == EXECUTOR:
+        return EXECUTOR_TOOL_NAMES
+    if MODE == VERIFIER:
+        return VERIFIER_TOOL_NAMES
+    return tuple(TOOL_FUNCS)
 
 def _active_tools() -> list[dict]:
     """FORK: tool schemas offered to the model in the current mode."""
@@ -874,8 +986,10 @@ def splash_screen() -> None:
     print(banner)
     print(f"    {APP_NAME} v{APP_VERSION} - local coding agent")
     print(f"    (c) by Prof. Dr. J. Fischer (MIT license)")
-    print("    Adapted for mejorador-audio (executor mode, model fallback)\n")
+    print("    Adapted for mejorador-audio and Abschrift (executor/verifier, model fallback)\n")
     print(f"    Mode      : {MODE.upper()}")  # FORK: always show the active mode
+    if PROJECT_DIR:  # FORK (E1)
+        print(f"    Project   : {PROJECT_DIR}")
     if FALLBACK.entries and ACTIVE_ENTRY is None:  # FORK: the warning would be cleared otherwise
         print(f"    {RED}WARNING   : no model of model_fallback could be activated "
               f"(API key env variable set?) - running on {BACKEND}{RESET}")
@@ -883,6 +997,8 @@ def splash_screen() -> None:
     print(f"    Backend   : {BACKEND} ({BASE_URL})")
     print(f"    Sandbox   : {SANDBOX}")
     print(f"    Max steps : {MAX_STEPS}")
+    print(f"    Secrets   : {_hidden_secrets_note()}")  # FORK (E4)
+    print(f"    Cell      : {_cell_note()}")  # FORK (E7)
     print("    " + "\u2500" * 50)
     print("    Describe a task: Enter submits, Ctrl+J starts a new line, Ctrl+C aborts")
     print("    the input or a running task, Ctrl+D or Ctrl+C on an empty prompt exits.")
@@ -890,7 +1006,16 @@ def splash_screen() -> None:
     print("    '/model' sets model, '/models' lists models, '/backend <name>' switches to")
     print("    lm-studio, ollama or a settings.json provider, '/max-turns N' sets step limit,")
     print("    '/reasoning high|medium|low|max|none' sets thinking effort (none = off),")
-    print("    '/mode executor|builder' switches mode and starts a new session.\n")
+    print(f"    '/mode {'|'.join(CONFIG.modes)}' switches mode and starts a new session.\n")
+
+def _hidden_secrets_note() -> str:
+    """FORK (E4): names (never values) of variables run_command does not see."""
+    hidden = sanitized_env(os.environ, CONFIG.env_passthrough)[1]
+    names = ", ".join(hidden[:6]) + (", ..." if len(hidden) > 6 else "")
+    note = f"{len(hidden)} variable(s) hidden from run_command" + (f" ({names})" if hidden else "")
+    if CONFIG.env_passthrough:
+        note += f"; passed through: {', '.join(CONFIG.env_passthrough)}"
+    return note
 
 # Descriptive action label per tool call - WITHOUT code/file content.
 def _action_label(name: str, args: dict) -> str:
@@ -1032,7 +1157,9 @@ def _chat(**kwargs):
                     continue
                 raise LLMUnavailable(
                     f"Every model in model_fallback is out of quota ({e}). "
-                    "Submit the task again later.") from e
+                    "Submit the task again later."
+                    + (" fallback_exhausted is 'stop': no other model is used."  # FORK (E3)
+                       if CONFIG.fallback_exhausted == FALLBACK_STOP else "")) from e
             if attempt == attempts:
                 break
             wait = (retry_delay_seconds(e) if limit else None) or RETRY_WAITS[attempt - 1]
@@ -1212,7 +1339,7 @@ def new_session() -> list:
         f"- mode {MODE}\n\n",
         encoding="utf-8",
     )
-    prompt_text = MODE_PROMPTS[MODE]  # FORK: system prompt depends on the mode
+    prompt_text = _mode_prompt()  # FORK: system prompt depends on the mode
     _log("### System prompt", prompt_text)
     messages = [{"role": "system", "content": prompt_text}]
 
@@ -1242,22 +1369,29 @@ def _report_sandbox_changes() -> None:
     only reports; restoring ('git restore .', 'git clean') stays a human
     decision.
     """
-    changed = git_changes(SANDBOX)
+    # FORK: verifier mode may change its write_paths; builder is checked
+    # against reports/ as before.
+    allowed = CONFIG.write_dirs(MODE) or (REPORTS_DIR_NAME,)
+    folders = ", ".join(f"{d}/" for d in allowed)
+    changed = git_changes(SANDBOX, allowed)
     if changed is None:
         print(f"{DIM}   (git check skipped: {SANDBOX} is not a git repository){RESET}")
         return
     _log("### git status after task", "\n".join(changed) or "(clean)")
     if not changed:
-        print(f"{DIM}   ✓ git: no changes outside {REPORTS_DIR_NAME}/{RESET}")
+        print(f"{DIM}   ✓ git: no changes outside {folders}{RESET}")
         return
-    color = RED if MODE == EXECUTOR else YELLOW
+    color = YELLOW if MODE == BUILDER else RED
     print(f"{color}⚠️  git: {len(changed)} file(s) changed outside "
-          f"{REPORTS_DIR_NAME}/:{RESET}")
+          f"{folders}:{RESET}")
     for path in changed[:20]:
         print(f"{color}     {path}{RESET}")
     if MODE == EXECUTOR:
         print(f"{color}   Executor mode must not change files. Review them; to undo: "
               f"'git restore .' (and 'git clean -n' for new files) in {SANDBOX}{RESET}")
+    elif MODE == VERIFIER:
+        print(f"{color}   Verifier mode may only change {folders}. Review them; to undo: "
+              f"'git restore -- <file>' (and 'git clean -n' for new files) in {SANDBOX}{RESET}")
 
 def run(task: str, messages: list) -> list:
     """FORK: wraps the original task loop (_run_steps) - switches back to the
@@ -1384,8 +1518,13 @@ def _set_mode(name: str) -> list | None:
     because the old history may contain calls to tools the new mode lacks."""
     global MODE, MAX_STEPS, LAST_USAGE_TOKENS
     mode = resolve_mode(name)
+    if mode == VERIFIER and mode not in CONFIG.modes:  # FORK (E2): only if configured
+        print(f"{RED}\u2717 Verifier mode is not configured: settings.json needs "
+              f"modes.verifier.write_paths (see README.md).{RESET}")
+        return None
     if mode is None:
-        print(f"{RED}\u2717 Use: /mode executor|builder (or ejecutor|constructor){RESET}")
+        print(f"{RED}\u2717 Use: /mode {'|'.join(CONFIG.modes)} "
+              f"(or ejecutor|constructor|verificador){RESET}")
         return None
     MODE, MAX_STEPS, LAST_USAGE_TOKENS = mode, CONFIG.max_steps[mode], 0
     print(f"{YELLOW}Mode: {MODE.upper()} - max steps {MAX_STEPS}, "
@@ -1425,22 +1564,32 @@ def _handle_command(text: str, session: list) -> tuple[bool, list]:
         MAX_STEPS = int(n) if (n := text[10:].strip()).isdigit() else MAX_STEPS; print(f"{DIM}Max steps: {MAX_STEPS}{RESET}"); return True, session
     return False, session
 
-def _start_backend() -> None:
+def _start_backend() -> bool:
     """FORK: start on the first usable model of model_fallback (an entry whose
     API key is missing is skipped), otherwise on default_provider as in the
-    original."""
+    original. With fallback_exhausted 'stop' (E3) there is no 'otherwise':
+    returns False and jcode does not start."""
     for entry in FALLBACK.entries:
         if _activate_entry(entry):
-            return
+            return True
+    if CONFIG.fallback_exhausted == FALLBACK_STOP:
+        print(f"{RED}\u2717 No model of model_fallback could be activated (API key "
+              f"variable set?) and fallback_exhausted is 'stop' - jcode uses no "
+              f"other model and does not start.{RESET}", file=sys.stderr)
+        return False
     if (d := SETTINGS.get("default_provider")): _switch_backend(d)
+    return True
 
 def main() -> None:
     SANDBOX.mkdir(exist_ok=True)
-    _start_backend()
-    if len(sys.argv) > 1:
+    if not _cell_ready():  # FORK (E7): no cell, no start (when configured)
+        sys.exit(2)
+    if not _start_backend():  # FORK (E3): 'stop' without a usable model
+        sys.exit(2)
+    if CLI_TASK:  # FORK (E1): task words without --project <folder>
         # Direct call with a task: compact header instead of full-screen splash.
-        print(f"{APP_NAME} v{APP_VERSION}  |  Mode: {MODE.upper()}  |  Backend: {BACKEND}  |  Model: {MODEL}  |  Sandbox: {SANDBOX}\n")
-        run(" ".join(sys.argv[1:]), new_session())
+        print(f"{APP_NAME} v{APP_VERSION}  |  Mode: {MODE.upper()}  |  Backend: {BACKEND}  |  Model: {MODEL}  |  Sandbox: {SANDBOX}  |  Cell: {'ON' if CELL.enabled else 'off'}\n")
+        run(" ".join(CLI_TASK), new_session())
     else:
         splash_screen()
         session = new_session()

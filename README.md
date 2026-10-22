@@ -1,4 +1,4 @@
-# jcode — adapted for mejorador-audio
+# jcode — adapted for mejorador-audio and Abschrift (0.10.0-ma.3)
 
 > **This is a fork.** Upstream: `gitty.informatik.hs-mannheim.de/fischerj/jcode`,
 > branch `multimodal`, commit `b37d004cb7` (2026-09-23), by Prof. Dr. Joern Fischer,
@@ -10,6 +10,18 @@
 > it runs long scripts and test batteries, reads their reports and diagnoses
 > failures — it does not fix code. The original behaviour is still available
 > as **builder** mode.
+>
+> Since version `0.10.0-ma.2` the same fork also serves the
+> [Abschrift](https://github.com/FrancisCode0o0) course project as a
+> **verifier** (it writes acceptance tests and reviews diffs) with its own
+> project folder and models. Without the new options jcode behaves exactly as
+> for mejorador-audio — except that `run_command` no longer sees API keys (E4).
+>
+> Since `0.10.0-ma.3` every agent of the VM can run in a **cell** (bubblewrap):
+> `run_command` sees only its project folder; the home folder is empty, the
+> environment holds no key. Required for Abschrift; prepared but **off** for
+> mejorador-audio until its plan step 1.0.e. Only the MejoraDeAudio chat
+> changes this repository, also for what only Abschrift uses.
 
 ## What this fork changes
 
@@ -31,21 +43,55 @@ Every change in `jcode.py` carries a `FORK:` comment; the new logic lives in
 | **`/models`** asks the active provider with its API key. | Upstream's call had no key, so it only worked for local servers. |
 | **Startup warning** in the splash screen when no fallback model could be activated (e.g. API key variable not set). | Upstream printed it before clearing the screen. |
 
-## Install (VM)
+### Added for Abschrift (version 0.10.0-ma.2, Abschrift plan step 0.1)
 
-```bash
-git clone https://github.com/FrancisCode0o0/jcode-adaptado.git ~/jcode-adaptado
-cd ~/jcode-adaptado
-python3 -m pip install openai ddgs Pillow pymupdf   # prompt_toolkit is no longer needed (jprompt.py)
-echo 'export GEMINI_API_KEY="..."' >> ~/.bashrc     # never in settings.json
-git clone https://github.com/FrancisCode0o0/mejorador-audio.git code   # the sandbox
-python3 jcode.py
-```
+| Change | Why |
+|---|---|
+| **E1 · `--project <folder>`** (also `--project=<folder>`, only before the task): `settings.json`, `code/` and `logs/` come from that folder. The folder must exist and contain a `settings.json`, otherwise jcode stops with exit code 2. Without the option everything stays next to `jcode.py`. The splash screen shows `Project`. | One jcode installation, two projects with their own models, sandbox and logs. A typo must never run a task on the other project. |
+| **E2 · verifier mode** (`/mode verifier`, aliases `verificador`, `pruefer`): the executor's tools; `write_file` only under `modes.verifier.write_paths`; own system prompt for writing acceptance tests from SPEC.md and reviewing diffs against SPEC.md/STIL.md, with the exit answer `KEINE FEHLER`. The mode **exists only** when settings.json configures it. The git check after each task accepts changes inside the write paths and flags everything else in red. | The reviewing agent must be able to write tests, but never the code it reviews. |
+| **E3 · `fallback_exhausted`**: `"default_provider"` (default, as before) or `"stop"`: jcode never leaves `model_fallback`; with no usable chain model it does not start (exit code 2), and an exhausted chain ends the task. Daily-quota detection only knows Gemini's wording; for other providers a 429 means "5 attempts, then the next model" (unchanged code path). | The reviewer must never silently become a model of the family that builds the code. |
+| **E4 · `run_command` without secrets**: every variable whose name contains `KEY`, `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD` or `CREDENTIAL` (case-insensitive) is removed from the command's environment, except names in `env_passthrough`. jcode itself keeps them (it needs its API key). The splash screen lists the hidden names, never values. | No shell command — and no model reading its output — can pass a key to another provider. |
 
-`code/` and `logs/` are git-ignored here. In the mejorador-audio repo,
-`reports/` must be in `.gitignore`.
+Limit of E4 alone: jcode and its commands run as the same Linux user, so a
+command could still *read files* holding keys (`~/.bashrc`, `/proc/<jcode>/environ`).
+The cell of 0.10.0-ma.3 closes that: inside it, those files do not exist.
+`GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_<n>`/`GIT_CONFIG_VALUE_<n>` are removed (or
+kept, via `GIT_CONFIG_COUNT` in `env_passthrough`) as one group, because
+removing only the `KEY_` part breaks every git command.
 
-Run the tests (no network, no key): `python3 -m pip install pytest && python3 -m pytest -q`
+### Added in 0.10.0-ma.3 (mejorador-audio plan step 1.0.b1)
+
+| Change | Why |
+|---|---|
+| **E7 · cells** (`jcode_cell.py`, `"sandbox"` in settings.json): with `"enabled": true` every `run_command` runs in bubblewrap — system read-only; `/home`, `/mnt`, `/media`, `/run/user`, `/srv`, `/tmp`, `/var/tmp` replaced by empty in-memory folders; then only the configured paths (`code/` writable, its `.git` read-only, Node/browsers read-only); empty environment except a short list; own PID namespace (a timeout also ends what the command left running); network open. bwrap itself starts with a two-variable environment (it is process 1 in the cell). jcode checks the cell from inside at start-up and refuses to start if it does not work; `"required": true` (Abschrift) also refuses `"enabled": false`. | One Linux user, one cell per agent (decision of 2026-10-20): the git check after a task then covers everything the agent could change, and a free model that may train on its input never sees a key or another project. |
+| **search_files / list_files stay in `code/`**: `..` in the glob is refused, symlinks that lead out of the sandbox are skipped. | Upstream (and every fork version up to ma.2) let one `search_files` call read e.g. `~/.bashrc` with the API key and pass it to the model. |
+| **Protected sub-folders** (`read_only_in_workdir`): every folder between the work folder and the protected one is mounted onto itself first. | A read-only `tests/acceptance` alone is bypassed with `mv tests x` (tested). |
+| **Interactive cells** (Gemini CLI): where the kernel still allows TIOCSTI, the program gets its own pseudo-terminal (`script`) in a new session. | Otherwise a process inside could type commands into Fran's shell that run after the cell ends (tested). |
+
+#### Scripts
+
+| Script | What it does |
+|---|---|
+| `tools/check_secrets.py` | Merged version (mejorador-audio 1.0 + Abschrift ma.2). Refuses commits with secrets: known formats (Google `AQ.…` and `AIza…`, `sk-…`, NVIDIA `nvapi-…`, Groq `gsk_…`, GitHub tokens, private keys, Kaggle, quoted `api_key = "…"` assignments) **and** the values of every secret-looking variable set right now. `--staged` (default, the hook), `--all`, `--range A..B` (every line the commits add, also lines removed later), `--diff FILE\|-`, `FILE…`. `--install-hook` only sets `core.hooksPath .githooks`; it never writes a hook file. No "allow" marker. Names file, line and rule (or variable NAME), never a value. |
+| `vm/session_check.sh [--quick] [project]` | Merged traffic light. Always: Python + openai, settings.json (modes, chain, cell), every chain key set (never shown), jcode-adaptado clean → `git pull --ff-only`, sandbox clean (the agent's own output folders only warn) and without secrets, `logs/`, hook, cell (built and inspected from inside), jcode tests. Without a project (mejorador-audio): venv, key length, pull of `code/`, disk, node, ffmpeg, ntfy, read-only `datos/`. With a project (Abschrift): chain without Google, `fallback_exhausted: stop`, cell on and required, trusted hook of the verifier clone. |
+| `vm/setup_abschrift.sh` | E8: meeting repo `~/repos/abschrift.git`, clones `~/jcode-projekte/abschrift/code` and `~/abschrift-gemini`, project folder, Gemini CLI 0.64.0 in `~/.local/opt/gemini-cli`, Abschrift's Playwright browsers in `~/.cache/ms-playwright-abschrift`, all three cells checked. Changes nothing of mejorador-audio; never overwrites. |
+| `vm/abschrift/start_jcode.sh`, `start_gemini.sh` | The only way to start the two agents: clean clone or stop, `--branch <phase>`, `git pull --ff-only`, then the agent in its cell. Git in the Gemini clone runs in a sync cell (no network, no home), because Gemini CLI can write that clone's `.git`. |
+| `vm/abschrift/push.sh gemini\|verifier` | Fran's push to the meeting repo: git runs only in the meeting repo; new commits are scanned for secrets; Gemini commits touching `tests/acceptance/` are refused; fast-forward only. |
+| `vm/abschrift/npm_install.sh` | npm packages and browsers of an Abschrift clone, in an install cell (npm runs package scripts). |
+| `vm/install_ma3.sh` | VM installation of ma.3: pull, bubblewrap, AppArmor check (Ubuntu's own fix only if needed), SSH check, `setup_abschrift.sh`, tests, both session checks → `MA3 READY`. |
+| `vm/verify_abschrift.sh` | The Abschrift 0.1.g list, checked for real; report without keys (scanned before it is shown). |
+| `vm/windows/install_ma3.ps1` | Windows part: package checked against `MANIFEST.sha256`, copied into both working copies, `check_secrets.py --all`, hook files executable in git, commit, push. |
+| `vm/agent-hooks/pre-commit` | Trusted hook for the Abschrift verifier clone (outside every cell). |
+| `tools/make_package.py` | Builds the delivery ZIP (for the MejoraDeAudio chat). |
+
+## Install
+
+Step by step: the installation guide of 0.10.0-ma.3 (MejoraDeAudio project).
+In short: Windows `vm/windows/install_ma3.ps1`, then in the VM
+`bash vm/install_ma3.sh` (after block D, `vm/setup_vm.sh`).
+
+Run the tests (no network, no key; the cell tests need bubblewrap):
+`python3 -m pytest -q` · mutation check: `python3 tests/mutation_check.py`.
 
 ## settings.json keys added by the fork
 
@@ -56,8 +102,15 @@ Run the tests (no network, no key): `python3 -m pip install pytest && python3 -m
 | `compact_threshold_tokens` | 60000 | History is compacted above this |
 | `max_command_timeout_s` | 14400 | Cap for the `timeout` of one `run_command` |
 | `model_fallback` | `[]` | Ordered list of `{provider, model, reasoning_effort, compact_threshold_tokens?}`; the first entry is the start model. Empty = upstream behaviour. |
+| `modes.verifier` | (absent) | `{"max_steps": 30, "write_paths": ["tests/acceptance/", "reports/"]}`. Absent or without a valid write path = no verifier mode. Paths must be relative, without `..`. |
+| `fallback_exhausted` | `"default_provider"` | `"stop"`: never use a model outside `model_fallback` (needs a non-empty chain). |
+| `env_passthrough` | `[]` | Exact variable names `run_command` may still see although they look secret, e.g. `["KAGGLE_KEY", "KAGGLE_API_TOKEN"]` for mejorador-audio. |
 
-Invalid values fall back to the default with a warning; jcode always starts.
+| `sandbox` | (absent = off) | Cell for `run_command` (see `jcode_cell.py`): `enabled`, `required`, `read_only`, `read_write` (absolute or `~/…`), `read_only_in_workdir` (relative), `git_read_only` (default true), `env`, `env_keep`, `expect_absent` (what the check must not see inside), `interactive`, `network`. |
+
+Invalid values fall back to the default with a warning; jcode always starts
+(exceptions, on purpose: a wrong `--project`, `fallback_exhausted: "stop"`
+without a usable model, and a cell that is switched on but does not work).
 The model ids in the shipped `settings.json` must be checked with `/models`.
 
 ---

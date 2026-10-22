@@ -1,0 +1,14 @@
+{
+  "_comment": "Cell for git in the Gemini CLI clone (status, branch change, git pull --ff-only from the meeting repo). Gemini CLI can write its clone's .git (it commits), so git configuration and hooks found there are not trusted: they run only here - no network, no home folder, no environment, the meeting repo read-only. Used by vm/abschrift/start_gemini.sh.",
+  "sandbox": {
+    "enabled": true,
+    "required": true,
+    "network": false,
+    "read_only": ["~/repos/abschrift.git"],
+    "git_read_only": false,
+    "env_keep": ["PATH", "LANG", "LC_ALL", "TZ"],
+    "expect_absent": ["~/.bashrc", "~/.ssh", "~/.gemini", "~/jcode-projekte", "~/jcode-adaptado",
+                      "/mnt/datos", "~/venv-audio"]
+  },
+  "env_passthrough": []
+}

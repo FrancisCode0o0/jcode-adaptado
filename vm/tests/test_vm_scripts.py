@@ -207,7 +207,12 @@ def vm_layout(tmp_path: Path) -> dict[str, str]:
     jcode = make_repo_with_origin(
         tmp_path,
         "jcode-adaptado",
-        {"test_ok.py": "def test_ok():\n    assert True\n", ".gitignore": "code/\n"},
+        {
+            "test_ok.py": "def test_ok():\n    assert True\n",
+            ".gitignore": "code/\nlogs/\n",
+            # ma.3: session_check reads settings.json with jcode's own parser
+            "settings.json": (VM_DIR.parent / "settings.json").read_text(encoding="utf-8"),
+        },
     )
     code = tmp_path / "code-clone"
     shutil.move(str(make_repo_with_origin(tmp_path, "code", {"README.md": "x\n"})), code)
@@ -403,3 +408,16 @@ def test_node_with_wrong_checksum_is_not_installed(tmp_path: Path, node_dist_ser
     assert result.returncode != 0
     assert "does not match" in result.stderr
     assert not (home / ".local/opt").exists() or not any((home / ".local/opt").iterdir())
+
+
+def test_session_red_when_a_helper_prints_nothing(vm_layout, tmp_path: Path) -> None:
+    """A crashed helper must never look like a passed check (fail closed):
+    here every python3 call silently succeeds without printing anything."""
+    stubs = tmp_path / "silent-python"
+    stubs.mkdir()
+    (stubs / "python3").write_text("#!/bin/sh\nexit 0\n")
+    (stubs / "python3").chmod(0o755)
+    env = {**vm_layout, "PATH": f"{stubs}{os.pathsep}{vm_layout['PATH']}"}
+    result = run_script("session_check.sh", "--quick", env=env)
+    assert result.returncode == 1
+    assert "the check printed nothing" in result.stdout
