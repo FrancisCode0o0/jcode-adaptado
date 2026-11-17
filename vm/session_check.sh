@@ -22,6 +22,11 @@
 # With a project (Abschrift): model chain without Google, fallback_exhausted
 #   "stop", cell switched on AND required, hook of the verifier clone. No
 #   pull of code/: the start script does it (vm/abschrift/start_jcode.sh).
+# With a project whose settings.json says "project_profile": "review"
+#   (ma.5, read-only review of La Reliquia del Alba): executor mode only,
+#   cell switched on AND required with read-only folders inside code/,
+#   fallback inside one provider, model in the report names; Google models
+#   allowed; no commit hook (nobody commits there).
 #
 # It never restores or discards anything: deciding what to do with
 # unexpected changes stays with Fran (plan decision). Keys are never printed.
@@ -160,7 +165,22 @@ for number, entry in enumerate(config.chain, 1):
     level = "OK" if present else ("FAIL" if number == 1 else "WARN")
     print(f"{level} model {number}: {entry.provider}/{entry.model} - "
           f"${variable} {'set' if present else 'NOT set'}")
-if is_project:
+profile = settings.get("project_profile", "abschrift") if is_project else ""
+if profile == "review":
+    print("OK executor mode only" if config.modes == ("executor",) else
+          f"FAIL allowed_modes must be [\"executor\"] for a review project (now {'/'.join(config.modes)})")
+    print("OK cell switched on and required" if cell.enabled and cell.required else
+          "FAIL sandbox.enabled and sandbox.required must both be true for this project")
+    print(f"OK read-only inside code/: {', '.join(cell.read_only_in_workdir)}"
+          if cell.read_only_in_workdir else
+          "FAIL sandbox.read_only_in_workdir must name the folder with the code under review")
+    print("OK model fallback stays inside one provider" if config.fallback_same_provider else
+          "FAIL fallback_same_provider must be true (each report from one model family)")
+    print("OK reports get the model in their name" if config.report_model_suffix else
+          "WARN report_model_suffix is off: name the model in each report yourself")
+elif profile not in ("", "abschrift"):
+    print(f"FAIL project_profile {profile!r} unknown (abschrift or review)")
+elif is_project:
     google = [f"{e.provider}/{e.model}" for e in config.chain
               if any(word in e.model.lower() for word in ("gemini", "gemma"))
               or "googleapis" in providers.get(e.provider, {}).get("base_url", "")]
@@ -249,7 +269,9 @@ check_logs() {
 check_hook() {
     local hooks
     hooks=$(git -C "$CODE_DIR" config --get core.hooksPath 2>/dev/null || true)
-    if [ -n "$project" ]; then
+    if [ -n "$project" ] && [ "$(project_profile)" = "review" ]; then
+        ok "review project: no commit hook needed (nobody commits in $CODE_DIR)"
+    elif [ -n "$project" ]; then
         if [ "$hooks" = "$EXTRAS_DIR/vm/agent-hooks" ] && [ -x "$hooks/pre-commit" ]; then
             ok "commit hook of the clone: $hooks (secret check)"
         else
@@ -260,6 +282,16 @@ check_hook() {
     else
         ok "no commit hook in code/ (nobody commits in the VM: no credentials)"
     fi
+}
+
+# ma.5: "abschrift" (default for --project) or "review".
+project_profile() {
+    python3 -I -c 'import json, sys
+try:
+    s = json.load(open(sys.argv[1], encoding="utf-8"))
+except (OSError, ValueError):
+    s = {}
+print(s.get("project_profile", "abschrift") if isinstance(s, dict) else "abschrift")' "$SETTINGS_FILE" 2>/dev/null || echo abschrift
 }
 
 check_cell() {
@@ -276,6 +308,26 @@ print("yes" if s.get("enabled") is True else "no")' "$SETTINGS_FILE" 2>/dev/null
     relay "cell" < <(python3 -I "$EXTRAS_DIR/jcode_cell.py" check --settings "$SETTINGS_FILE" \
         --workdir "$CODE_DIR" 2>&1 | sed -e 's/^OK /OK cell: /' -e 's/^FAIL /FAIL cell: /' \
         -e 's/^WARN /WARN cell: /')
+}
+
+# ma.4: the X server must not accept programs of the same user without a cookie
+# (2026-10-22: fixed with dpkg-divert of the Xsession script and
+# 'xhost -SI:localuser:<user>'). The cell check already sees the effect from
+# inside; this says the cause.
+XHOST_LOCAL_SCRIPT=${XHOST_LOCAL_SCRIPT:-/etc/X11/Xsession.d/35x11-common_xhost-local}
+check_x_access() {
+    local found=0
+    if [ -e "$XHOST_LOCAL_SCRIPT" ]; then
+        warn "X server: $XHOST_LOCAL_SCRIPT is back (an update?); it lets programs of your user use X without a cookie. Divert it again as on 2026-10-22 (plan, DECISIONES)"
+        found=1
+    fi
+    if [ -n "${DISPLAY:-}" ] && command -v xhost >/dev/null && xhost 2>/dev/null | grep -q 'SI:localuser:'; then
+        warn "X server: xhost has a SI:localuser rule (access without cookie); remove it with: xhost -SI:localuser:$(id -un)"
+        found=1
+    fi
+    if [ "$found" -eq 0 ]; then
+        ok "X server: no access without cookie (no xhost-local script, no SI:localuser rule)"
+    fi
 }
 
 run_jcode_tests() {
@@ -378,6 +430,7 @@ fi
 check_logs
 check_hook
 check_cell
+check_x_access
 run_jcode_tests
 if [ -z "$project" ]; then
     check_disk

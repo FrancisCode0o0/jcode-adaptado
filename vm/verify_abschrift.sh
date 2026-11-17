@@ -196,7 +196,7 @@ section "Result: $fails FAIL, $pending PENDING"
 
 # Never show a report that contains a key (patterns and values of this shell).
 if ! python3 -I "$ABSCHRIFT_JCODE_DIR/tools/check_secrets.py" "$REPORT" >/dev/null 2>&1; then
-    echo "STOP: the report matched the secret check; it is NOT shown. Paste nothing; ask in the MejoraDeAudio chat." >&2
+    echo "STOP: the report matched the secret check; it is NOT shown. Paste nothing; ask in the chat that works on jcode." >&2
     exit 1
 fi
 cat "$REPORT"

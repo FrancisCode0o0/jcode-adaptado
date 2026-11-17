@@ -402,8 +402,8 @@ def test_search_files_stays_inside_the_sandbox(jc, tmp_path):
     secret_file.write_text(f"export GEMINI_API_KEY={FAKE_SECRET}\n")
     (jc.sandbox / "leak").symlink_to(secret_file)
     (jc.sandbox / "ok.txt").write_text("GEMINI is fine here\n")
-    assert "not allowed" in jc.mod.search_files("GEMINI", "../bashrc")
-    assert "not allowed" in jc.mod.search_files("GEMINI", "**/../../bashrc")
+    assert "must not contain '..'" in jc.mod.search_files("GEMINI", "../bashrc")
+    assert "must not contain '..'" in jc.mod.search_files("GEMINI", "**/../../bashrc")
     hits = jc.mod.search_files("GEMINI")
     assert FAKE_SECRET not in hits and "ok.txt:1" in hits
     assert "leak" not in jc.mod.list_files()

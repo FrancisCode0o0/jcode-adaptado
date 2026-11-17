@@ -14,7 +14,7 @@ ABSCHRIFT_REPO="${ABSCHRIFT_REPO:-$HOME/repos/abschrift.git}"
 ABSCHRIFT_PROJECT="${ABSCHRIFT_PROJECT:-$HOME/jcode-projekte/abschrift}"
 ABSCHRIFT_VERIFIER_CLONE="$ABSCHRIFT_PROJECT/code"
 ABSCHRIFT_GEMINI_CLONE="${ABSCHRIFT_GEMINI_CLONE:-$HOME/abschrift-gemini}"
-# Cell profiles (part of jcode-adaptado: only the MejoraDeAudio chat changes them).
+# Cell profiles (part of jcode-adaptado).
 ABSCHRIFT_PROFILES="$ABSCHRIFT_JCODE_DIR/examples/abschrift"
 # Gemini CLI: fixed version, outside PATH (start only through start_gemini.sh).
 # Abschrift plan v12 A4/A9: npm "latest" was 0.64.0 on 2026-10-20 (Node >= 20).

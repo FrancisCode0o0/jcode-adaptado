@@ -28,7 +28,7 @@ set -Eeuo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 JCODE_DIR="$(dirname "$SCRIPT_DIR")"
 readonly SCRIPT_DIR JCODE_DIR
-readonly EXPECTED_VERSION="0.10.0-ma.3"
+readonly EXPECTED_VERSION="0.10.0-ma.3"  # or a later 0.10.0-ma.N (ma.4: re-running stays possible)
 readonly VENV_DIR="$HOME/venv-audio"
 readonly ABSCHRIFT_PROJECT="$HOME/jcode-projekte/abschrift"
 # Overridable only so the tests can use temporary files.
@@ -56,8 +56,10 @@ update_jcode() {
     git -C "$JCODE_DIR" pull --ff-only --quiet \
         || die "'git pull --ff-only' failed (offline, or did Windows push ma.3?)"
     version=$(sed -n 's/^APP_VERSION = "\([^"]*\)".*/\1/p' "$JCODE_DIR/jcode.py")
-    [ "$version" = "$EXPECTED_VERSION" ] \
-        || die "jcode.py is $version, expected $EXPECTED_VERSION: run vm/windows/install_ma3.ps1 on Windows first"
+    case "$version" in
+        0.10.0-ma.[3-9]|0.10.0-ma.[1-9][0-9]) ;;
+        *) die "jcode.py is $version, expected $EXPECTED_VERSION or later: run vm/windows/install_ma3.ps1 on Windows first" ;;
+    esac
     echo "jcode-adaptado at $(git -C "$JCODE_DIR" rev-parse --short HEAD), jcode $version"
 }
 
@@ -66,8 +68,9 @@ install_bubblewrap() {
         echo "bubblewrap already installed: $(bwrap --version)"
         return
     fi
-    sudo apt-get update
-    sudo apt-get install -y bubblewrap
+    # No terminal on apt-get's stdin (ma.4; see apt_install in setup_vm.sh).
+    sudo env DEBIAN_FRONTEND=noninteractive apt-get update </dev/null
+    sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y bubblewrap </dev/null
     echo "bubblewrap installed: $(bwrap --version)"
 }
 
@@ -86,10 +89,10 @@ enable_user_namespaces() {
     echo "AppArmor setting kernel.apparmor_restrict_unprivileged_userns:" \
          "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo unknown)"
     if [ -e "$APPARMOR_TARGET" ]; then
-        die "the profile $APPARMOR_TARGET is already there and bwrap still fails. Nothing changed automatically; paste this output in the MejoraDeAudio chat."
+        die "the profile $APPARMOR_TARGET is already there and bwrap still fails. Nothing changed automatically; paste this output in the chat that works on jcode."
     fi
     if [ ! -e "$APPARMOR_EXTRA" ]; then
-        sudo apt-get install -y apparmor-profiles
+        sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y apparmor-profiles </dev/null
     fi
     [ -e "$APPARMOR_EXTRA" ] || die "Ubuntu's bwrap profile ($APPARMOR_EXTRA) not found; nothing changed."
     echo "Loading Ubuntu's own profile for bwrap (documented fix, one time):"

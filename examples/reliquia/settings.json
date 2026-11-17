@@ -1,0 +1,58 @@
+{
+  "_comment": "jcode settings for the read-only review of La Reliquia del Alba (jcode 0.10.0-ma.5; vm/setup_reliquia.sh copies it to ~/jcode-projekte/reliquia/settings.json and never overwrites it). Executor only; the code under review is code/juego, read-only for the agent; reports go to code/reports/ with the model in the name. Budget 0 EUR. Keys only as environment variables in ~/.bashrc, set with read -rs.",
+  "project_profile": "review",
+  "default_provider": "gemini",
+  "default_mode": "executor",
+  "allowed_modes": ["executor"],
+  "modes": {
+    "executor": { "max_steps": 20 }
+  },
+  "compact_threshold_tokens": 60000,
+  "max_command_timeout_s": 600,
+  "fallback_exhausted": "stop",
+  "fallback_same_provider": true,
+  "report_model_suffix": true,
+  "env_passthrough": [],
+  "sandbox": {
+    "_comment": "Required: without a working cell jcode does not start. Inside: code/ writable only for reports/ (code/juego and code/.git read-only), no network, empty home: no ~/.bashrc, no keys, no other project, no /mnt/datos.",
+    "enabled": true,
+    "required": true,
+    "read_only": [],
+    "read_only_in_workdir": ["juego"],
+    "git_read_only": true,
+    "network": false,
+    "expect_absent": ["~/.bashrc", "~/.ssh", "~/.gemini", "~/abschrift-gemini", "~/repos",
+                      "/mnt/datos", "~/jcode-adaptado", "~/venv-audio", "~/.cache/ms-playwright",
+                      "~/jcode-projekte/abschrift", "~/jcode-projekte/reliquia/settings.json",
+                      "~/jcode-projekte/reliquia/logs"]
+  },
+  "model_fallback": [
+    { "provider": "gemini", "model": "gemini-3.8-flash", "reasoning_effort": "low" },
+    { "provider": "gemini", "model": "gemini-3.5-flash-lite", "reasoning_effort": "low" }
+  ],
+  "providers": {
+    "gemini": {
+      "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
+      "api_key_env": "GEMINI_API_KEY",
+      "model": "gemini-3.8-flash"
+    },
+    "openrouter": {
+      "_comment": "Free model (ID ends in :free): 20 requests/minute, 50/day without bought credits. Its free endpoints may log and train on prompts.",
+      "base_url": "https://openrouter.ai/api/v1",
+      "api_key_env": "OPENROUTER_API_KEY",
+      "model": "qwen/qwen3-coder:free"
+    },
+    "ollama-cloud": {
+      "_comment": "Ollama Cloud free plan: usage limits per 5 hours and per week (GPU time, not published as numbers); no logging or training of prompts per Ollama.",
+      "base_url": "https://ollama.com/v1",
+      "api_key_env": "OLLAMA_API_KEY",
+      "model": "qwen3-coder:480b-cloud"
+    },
+    "nvidia": {
+      "_comment": "build.nvidia.com, account exists since 2026-10-25; 40 requests/minute; NVIDIA may use the data to improve its models. Check the exact Qwen model id in its catalog before the first run.",
+      "base_url": "https://integrate.api.nvidia.com/v1",
+      "api_key_env": "NVIDIA_API_KEY",
+      "model": "qwen/qwen3-coder-480b-a35b-instruct"
+    }
+  }
+}

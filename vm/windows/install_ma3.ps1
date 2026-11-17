@@ -1,6 +1,7 @@
 <#
 .SYNOPSIS
-  Windows part of installing jcode 0.10.0-ma.3: copy the package into both
+  Windows part of installing a jcode-adaptado package (now 0.10.0-ma.6; the
+  file name stays from ma.3): copy the package into both
   working copies, check them for secrets, commit and push.
 
 .DESCRIPTION
@@ -22,8 +23,8 @@
   It never deletes, resets or forces anything.
 
 .EXAMPLE
-  Expand-Archive "$env:USERPROFILE\Downloads\jcode-adaptado-0.10.0-ma.3.zip" "$env:USERPROFILE\Downloads\ma3"
-  powershell -ExecutionPolicy Bypass -File "$env:USERPROFILE\Downloads\ma3\jcode-adaptado\vm\windows\install_ma3.ps1"
+  Expand-Archive "$env:USERPROFILE\Downloads\jcode-adaptado-0.10.0-ma.6.zip" "$env:USERPROFILE\Downloads\ma6"
+  powershell -ExecutionPolicy Bypass -File "$env:USERPROFILE\Downloads\ma6\jcode-adaptado\vm\windows\install_ma3.ps1"
 #>
 param(
     [string]$Package = "",                                   # default: the unpacked package this script is in
@@ -33,8 +34,8 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$ExpectedVersion = "0.10.0-ma.3"
-$CommitMessage = "jcode ${ExpectedVersion}: cells (bubblewrap), merged secret check and session check, Abschrift setup"
+$ExpectedVersion = "0.10.0-ma.6"
+$CommitMessage = "jcode ${ExpectedVersion}: ma.4 (upstream 2026-10-22 parts, VM script fixes) + read-only review project (allowed_modes, same-provider fallback, model in report names, setup_reliquia.sh with the modules of settings.gradle)"
 # Hooks run directly by git: they must be executable in the repository.
 $ExecutableFiles = @{
     "jcode-adaptado"  = @(".githooks/pre-commit", "vm/agent-hooks/pre-commit")
@@ -171,7 +172,7 @@ try {
         if (Install-Into $source $target.Repo $target.Name $python) { Push-Repo $target.Repo $target.Name }
     }
     Write-Host ""
-    Write-Host "WINDOWS DONE. Next, in the VM: bash ~/jcode-adaptado/vm/install_ma3.sh"
+    Write-Host "WINDOWS DONE. Next, in the VM: git -C ~/jcode-adaptado pull --ff-only, then bash ~/jcode-adaptado/vm/session_check.sh"
 } catch {
     Write-Host $_.Exception.Message -ForegroundColor Red
     exit 1

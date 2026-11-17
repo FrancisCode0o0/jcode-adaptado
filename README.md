@@ -1,8 +1,10 @@
-# jcode — adapted for mejorador-audio and Abschrift (0.10.0-ma.3)
+# jcode — adapted for mejorador-audio, Abschrift and the Reliquia review (0.10.0-ma.6)
 
 > **This is a fork.** Upstream: `gitty.informatik.hs-mannheim.de/fischerj/jcode`,
 > branch `multimodal`, commit `b37d004cb7` (2026-09-23), by Prof. Dr. Joern Fischer,
-> MIT license. Everything below the line *"Original README"* is upstream's
+> MIT license. Since `0.10.0-ma.4` the base also includes parts of upstream's
+> `jcode.py` of 2026-10-22 (still called 0.10.0, no commit hash; SHA-256
+> `64c88a1966e6b853…`), listed below. Everything below the line *"Original README"* is upstream's
 > documentation, unchanged except where marked.
 >
 > The fork turns jcode into a background **executor** for the
@@ -20,8 +22,7 @@
 > Since `0.10.0-ma.3` every agent of the VM can run in a **cell** (bubblewrap):
 > `run_command` sees only its project folder; the home folder is empty, the
 > environment holds no key. Required for Abschrift; prepared but **off** for
-> mejorador-audio until its plan step 1.0.e. Only the MejoraDeAudio chat
-> changes this repository, also for what only Abschrift uses.
+> mejorador-audio until its plan step 1.0.e.
 
 ## What this fork changes
 
@@ -82,7 +83,59 @@ removing only the `KEY_` part breaks every git command.
 | `vm/verify_abschrift.sh` | The Abschrift 0.1.g list, checked for real; report without keys (scanned before it is shown). |
 | `vm/windows/install_ma3.ps1` | Windows part: package checked against `MANIFEST.sha256`, copied into both working copies, `check_secrets.py --all`, hook files executable in git, commit, push. |
 | `vm/agent-hooks/pre-commit` | Trusted hook for the Abschrift verifier clone (outside every cell). |
-| `tools/make_package.py` | Builds the delivery ZIP (for the MejoraDeAudio chat). |
+| `tools/make_package.py` | Builds the delivery ZIP of a version. |
+
+### New in 0.10.0-ma.6 (2026-11-17)
+
+- `vm/setup_reliquia.sh` copies `<module>/src` and `<module>/build.gradle` of
+  every module that the `settings.gradle` of the chosen ref includes (no
+  fixed list; since the branch `motor`: motor, reliquia, lwjgl3, headless),
+  plus the root build files. It stops with the module's name if a module has
+  no `src/`, and also if settings.gradle is missing, includes nothing,
+  changes a `projectDir` or names a module outside the repository. A failed
+  `--refresh` keeps the old snapshot.
+- `examples/reliquia/AGENTS.md`: the reviewer rules of the Reliquia Tutor
+  (replaces the provisional text of ma.5).
+- No rule about which chat may change this repository: any chat may, when
+  Fran asks.
+
+### New in 0.10.0-ma.5 (read-only review of La Reliquia del Alba, 2026-11-17)
+
+Three optional settings.json keys; without them nothing changes for
+mejorador-audio or Abschrift:
+
+- `"allowed_modes": ["executor"]` — `/mode` only accepts these modes.
+- `"fallback_same_provider": true` — a quota fallback never leaves the
+  provider in use; a hand-picked model outside the chain stops instead of
+  continuing on another model family.
+- `"report_model_suffix": true` — files a task writes in `reports/` are
+  renamed to `<name>__<model>.md` (never overwriting: `-2`, `-3`…).
+
+Project template in `examples/reliquia/` (settings.json, AGENTS.md;
+ma.5 shipped a provisional AGENTS.md), set up with `vm/setup_reliquia.sh <repo or bundle> [ref]`:
+`~/jcode-projekte/reliquia`, code under review in `code/juego` (Java
+sources and build files only; read-only on disk and in the cell), cell
+required and without network. `vm/session_check.sh <project>` checks a
+project with `"project_profile": "review"` by its own rules (executor only,
+cell required with read-only folders, same-provider fallback; Google models
+allowed; no commit hook). `docs/jcode-vs-upstream.diff` regenerated.
+
+### Taken from upstream in 0.10.0-ma.4 (jcode.py of 2026-10-22)
+
+| Change | Why |
+|---|---|
+| **`run_command` in its own process group**; on a timeout the whole tree is killed and the output until then is returned; bash (not dash) with `pipefail` for pipes; the pip interpreter path is quoted. In a cell the command runs in `bash -c` too. | A test that starts a server or Chrome no longer survives its timeout; `test \| head` no longer hides a failing test. |
+| **Loop guard**: an identical call (same arguments, same result) within the last 10 calls counts as a repeat; at 3 a reflection step is injected, a second time the task stops. **Failure streak**: 3 failures of the same tool with the same kind of error (paths and numbers masked) → warning and reflection; again → stop. | Unattended runs must not burn the daily quota in a loop. |
+| **`read_file` with `start_line` / `end_line`**, and a clear message for binary files. | Reading the region around a hit instead of a whole log. |
+| **`list_files` / `search_files` skip** `node_modules`, `.git`, `venv`, caches… (unless the glob names them); at most 300 list entries. | Thousands of files after `npm install` would fill the context. |
+| **4xx answers are not retried** (except 408/409/429; **429 still goes to the model fallback**). A rejection because of images removes them and continues text-only; "context too long" compacts once. | Retrying a bad request four times only wastes quota. |
+| **One stats line per response** (time, tokens, tokens/s, context sent). | Visible in the log what each step cost. |
+| **No-op `write_file` and `edit_file` with old = new** are reported to the model (and count for the failure streak). | A symptom of a model going in circles. |
+| **`_resolve`**: absolute paths are judged by where they point (with a hint naming the project directory); a garbled prefix ending in `<parent>/code/…` is re-rooted; `~` is expanded (and refused). Same protection as the ma.3 fix, better messages. | — |
+
+**Not taken from that version:** skills (`skills/`, `load_skill`, one extra request per task to pick skills), AGENTS.md merged into the single system message (our compaction keeps the leading system messages), its defaults (model, temperature 0.3, reasoning "medium", `autoCompact*` keys: our settings.json decides; temperature stays 0.2).
+
+**Fork changes in 0.10.0-ma.4:** the builder prompt no longer tells the model to `pip install` a missing module (report it instead), and `run_command`'s description no longer offers installing; `vm/setup_vm.sh` installs the browser libraries from Playwright's `--dry-run` list with its own `apt-get` (stdin `/dev/null`) instead of `playwright install-deps` (whose apt-get stopped in state T on 2026-10-22), and every `apt-get` of the installers reads `/dev/null`; its final message no longer asks for a snapshot before the guide does; `vm/windows/snapshot_vm.ps1` defaults to `E:\VMs\uni-linux`, says clearly when the folder is missing, and `-Start` returns the prompt; `vm/session_check.sh` warns when the X server accepts programs of the same user without a cookie again (xhost-local script back, or a `SI:localuser` rule) and names the fix. `docs/jcode-vs-upstream.diff` is now the diff against upstream's 2026-10-22 file.
 
 ## Install
 

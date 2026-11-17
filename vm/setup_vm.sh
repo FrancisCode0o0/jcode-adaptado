@@ -16,7 +16,7 @@
 #   2. Node.js LTS in ~/.local/opt (no sudo), checked against nodejs.org's
 #      SHA-256 list; added to PATH in ~/.bashrc once
 #   3. Python packages: pinned + hashed (vm/requirements-ref.txt)
-#   4. Playwright: system libraries (may warn on new Ubuntu) + 3 browsers
+#   4. Playwright: system libraries (Playwright's list, our own apt-get) + 3 browsers
 #   5. jcode's own tests (the package update must not break jcode)
 #   6. vm/check_vm.py: every tool does a small real job
 
@@ -51,9 +51,16 @@ check_preconditions() {
     echo "Python $python_version in $VIRTUAL_ENV. sudo will ask for your password once."
 }
 
+# apt-get without the terminal on stdin: on 2026-10-22 an apt-get started with the
+# terminal attached stopped in state T after installing (ma.4). sudo still asks for
+# the password through /dev/tty, so </dev/null does not block the password prompt.
+apt_install() {
+    sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y "$@" </dev/null
+}
+
 install_system_packages() {
-    sudo apt-get update
-    sudo apt-get install -y ffmpeg curl xz-utils ca-certificates
+    sudo env DEBIAN_FRONTEND=noninteractive apt-get update </dev/null
+    apt_install ffmpeg curl xz-utils ca-certificates
 }
 
 node_platform() {
@@ -110,14 +117,28 @@ install_python_packages() {
     python -m pip install --require-hashes -r "$SCRIPT_DIR/requirements-ref.txt"
 }
 
+# Packages Playwright says are missing, one per line. Its 'install-deps' would
+# run apt-get itself from node with the terminal attached (stopped in state T on
+# 2026-10-22), so only its --dry-run list is used ("Missing system dependencies
+# (N):" followed by "  package" lines, or "All system dependencies are installed.").
+missing_browser_packages() {
+    python -m playwright install-deps --dry-run chromium firefox webkit </dev/null 2>&1 \
+        | sed -n '/^Missing system dependencies/,$ s/^  \([^[:space:]]\{1,\}\)$/\1/p'
+}
+
 install_browsers() {
-    # install-deps calls sudo apt-get itself. Ubuntu 26.04 may be newer than
-    # Playwright's list of supported systems: warn and go on; step 6 opens
-    # each browser for real, so a missing library is caught there.
-    if ! python -m playwright install-deps chromium firefox webkit; then
-        echo "WARNING: install-deps failed; step 6 will show which browser is affected."
+    local packages
+    mapfile -t packages < <(missing_browser_packages || true)
+    if [ "${#packages[@]}" -gt 0 ]; then
+        echo "Installing ${#packages[@]} system libraries for the browsers (Playwright's list)."
+        # Ubuntu 26.04 may be newer than Playwright's list: warn and go on; step 6
+        # opens each browser for real, so a missing library is caught there.
+        apt_install --no-install-recommends "${packages[@]}" \
+            || echo "WARNING: some libraries could not be installed; step 6 will show which browser is affected."
+    else
+        echo "No missing system libraries reported by Playwright."
     fi
-    python -m playwright install chromium firefox webkit
+    python -m playwright install chromium firefox webkit </dev/null
 }
 
 run_jcode_tests() {
@@ -133,8 +154,8 @@ main() {
     step 5 "jcode tests";                      run_jcode_tests
     step 6 "Final check";                      python "$SCRIPT_DIR/check_vm.py"
     echo
-    echo "Block D done. Next: open a NEW terminal (PATH changed), shut the VM down"
-    echo "and take a snapshot with vm/windows/snapshot_vm.ps1."
+    echo "Block D done. Next: open a NEW terminal (PATH changed) and go on with the"
+    echo "guide; the snapshot comes once vm/session_check.sh says GREEN."
 }
 
 # Run only when executed; the tests 'source' this file to call one function.

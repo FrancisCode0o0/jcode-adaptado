@@ -5,22 +5,28 @@
 """jcode - minimal coding agent for local LLMs, sandboxed to ./code.
 Setup, usage and configuration: see README.md.
 
-This fork (based on the 'multimodal' branch, commit b37d004cb7) adds an
+This fork (based on the 'multimodal' branch, commit b37d004cb7, plus parts
+of upstream's jcode.py of 2026-10-22 since 0.10.0-ma.4) adds an
 'executor' mode, automatic model fallback on exhausted daily quotas,
 settings.json-driven limits and a git check after every task; for Abschrift
 also '--project <folder>', a 'verifier' mode, 'fallback_exhausted: stop' and
 a run_command environment without secrets; for both projects an optional
 bubblewrap cell for run_command ("sandbox" in settings.json, 0.10.0-ma.3,
-module jcode_cell.py). Every change is marked with
+module jcode_cell.py); since 0.10.0-ma.5 'allowed_modes',
+'fallback_same_provider' and 'report_model_suffix' (read-only review of
+La Reliquia del Alba). Every change is marked with
 'FORK:' and listed in README.md; the new logic itself lives in
 jcode_extras.py."""
 
+import collections  # ma.4 (upstream 2026-10-22): loop guard window
 import difflib
 import inspect
 import json
 import os
 import re
+import shlex  # ma.4 (upstream 2026-10-22): quote the interpreter path for pip
 import shutil  # FORK (E7): find bwrap
+import signal  # ma.4 (upstream 2026-10-22): kill the whole process tree on timeout
 import subprocess
 import sys
 import time
@@ -41,8 +47,8 @@ from openai import OpenAI
 from jcode_extras import (  # FORK: additions for mejorador-audio and Abschrift
     BUILDER, EXECUTOR, EXECUTOR_PROMPT, EXECUTOR_TOOL_NAMES, FALLBACK_STOP,
     REPORTS_DIR_NAME, SETTINGS_FILE_NAME, VERIFIER, VERIFIER_TOOL_NAMES,
-    FallbackChain, classify_rate_limit, git_changes, is_under_any,
-    load_config, parse_cli_args, resolve_mode, retry_delay_seconds,
+    FallbackChain, add_model_suffix, classify_rate_limit, git_changes, is_under_any,
+    load_config, parse_cli_args, report_names, resolve_mode, retry_delay_seconds,
     sanitized_env, verifier_prompt,
 )
 from jcode_cell import (  # FORK (E7): run_command inside a bubblewrap cell
@@ -51,7 +57,7 @@ from jcode_cell import (  # FORK (E7): run_command inside a bubblewrap cell
 
 # --------------------------------------------------------------- Configuration
 APP_NAME = "jcode"
-APP_VERSION = "0.10.0-ma.3"  # FORK: upstream 0.10.0 + adaptation 3 (mejorador-audio, Abschrift)
+APP_VERSION = "0.10.0-ma.6"  # FORK: upstream 0.10.0 (2026-10-22) + adaptation 6 (mejorador-audio, Abschrift, Reliquia review)
 DEFAULT_MODEL = "qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive"
 MODEL = DEFAULT_MODEL
 
@@ -157,6 +163,8 @@ SANDBOX = (BASE_DIR / "code").resolve()  # FORK: next to jcode.py or in --projec
 # (executor 15, builder 40 by default); /mode and /max-turns change them.
 MODE = CONFIG.default_mode
 MAX_STEPS = CONFIG.max_steps[MODE]
+MAX_REPEATS = 3   # identical tool calls (within REPEAT_WINDOW) or same-error failures before a reflection step; twice = stop
+REPEAT_WINDOW = 10  # how many recent tool calls an identical call is compared against (catches A-B-A-B cycles)
 CMD_TIMEOUT = 60  # seconds per command (compiling C/C++/Java takes time)
 MAX_CMD_TIMEOUT = CONFIG.max_command_timeout  # FORK: cap for the per-call timeout
 CONTEXT_LIMIT = 256_000       # context window of the model (tokens)
@@ -173,7 +181,7 @@ LOG_FILE = LOG_DIR / "jcode-session.md"  # replaced by a dated name in new_sessi
 _REQ_NR = 0  # running number of LM Studio requests
 
 # FORK: automatic model fallback when a daily quota is exhausted.
-FALLBACK = FallbackChain(CONFIG.chain)
+FALLBACK = FallbackChain(CONFIG.chain, same_provider=CONFIG.fallback_same_provider)  # FORK (ma.5)
 ACTIVE_ENTRY = None        # chain entry currently in use (None = manual/local model)
 _AUTO_SWITCHED = False     # True once the fallback left the first model
 
@@ -219,8 +227,9 @@ SYSTEM_PROMPT = (
     "tool result - describe only what you actually see, never guess.\n\n"
     "Language: reply in the same language as the task (German task -> German answers, English task -> English).\n\n"
     "How to work:\n"
-    "1. Locate code with search_files and read a file before you edit it. "
-    "For line-based changes "
+    "1. Locate code with search_files and read a file before you edit it; for "
+    "large files read only the region around the hit (start_line/end_line) "
+    "instead of the whole file again. For line-based changes "
     "(insert_lines/delete_lines) read it with numbered=true; re-read the line "
     "numbers after each change, since they shift.\n"
     "2. Always write a smoke test or test for your code and run it with "
@@ -229,7 +238,9 @@ SYSTEM_PROMPT = (
     "Project-specific conventions per language come from AGENTS.md. If a "
     "compiler/interpreter is missing (command not found), report that in the "
     "summary instead of hiding it. If a Python library is missing "
-    "(ModuleNotFoundError), install it via 'pip install <package>' and run the test again.\n"
+    # FORK (ma.4): upstream said 'install it via pip install'; these projects
+    # install nothing from inside the agent (AGENTS.md, and the cell forbids it).
+    "(ModuleNotFoundError), report it in the summary; never install anything.\n"
     "3. If the test fails, analyze the output, fix the code and run the test "
     "again. Repeat until it passes.\n"
     "4. Only then, without a tool call, reply with a short summary, once the "
@@ -248,44 +259,104 @@ def _mode_prompt() -> str:
     return MODE_PROMPTS[MODE]
 
 # ----------------------------------------------------------------- Path sandbox
-def _resolve(rel_path: str) -> Path:
-    """Resolves rel_path inside the sandbox; prevents escape (../)."""
-    rel_path = (rel_path or ".").strip().lstrip("/")
-    # The model sometimes redundantly prefixes paths with the sandbox name
-    # ('code/'). Remove such leading segments so no nested code/code is
-    # created.
-    parts = list(Path(rel_path).parts)
-    while parts and parts[0] == SANDBOX.name:
-        parts.pop(0)
-    rel_path = str(Path(*parts)) if parts else "."
-    p = (SANDBOX / rel_path).resolve()
-    if p != SANDBOX and SANDBOX not in p.parents:
-        raise ValueError(f"Path '{rel_path}' lies outside the sandbox.")
-    return p
+def _inside(p: Path, root: Path) -> bool:
+    return p == root or root in p.parents
+
+def _resolve(path: str, write: bool = False) -> Path:
+    """Maps a tool path to a real, symlink-free path inside ./code.
+
+    Upstream 2026-10-22 (ma.4): relative paths are relative to ./code (a
+    redundant leading 'code/' is dropped); absolute paths are taken as they
+    are, except a path whose tail is '<parent-of-sandbox>/<sandbox>/...' with a
+    garbled prefix, which is re-rooted into ./code. resolve() follows symlinks
+    and '..', so a link pointing outside is judged by its target.
+    FORK: upstream also allows reads in its skills/ folder; this fork installs
+    no skills, so everything outside ./code is refused. 'write' is kept for
+    the upstream call sites (the write guard itself is in write_file).
+    """
+    raw = (path or ".").strip()
+    p = Path(raw).expanduser()                  # '~/x' is absolute, not a folder named '~'
+    parts = list(p.parts)
+    if not p.is_absolute():
+        while parts and parts[0] == SANDBOX.name:
+            parts.pop(0)
+        p = SANDBOX.joinpath(*parts)
+    elif not _inside(p.resolve(), SANDBOX) and _garbled_sandbox_tail(parts) is not None:
+        p = SANDBOX.joinpath(*_garbled_sandbox_tail(parts))
+    p = p.resolve()
+    if _inside(p, SANDBOX):
+        return p
+    where = (f" The project directory is '{SANDBOX}' - your path does not start with it "
+             f"(typo in the directory part?)." if Path(raw).expanduser().is_absolute() else "")
+    raise ValueError(f"'{raw}' is outside the project.{where} Use a path RELATIVE to the "
+                     f"project directory, e.g. 'app.html' or 'src/main.py'.")
+
+def _garbled_sandbox_tail(parts: list[str]) -> list[str] | None:
+    """For an absolute path like '/Users/x/02__PROJECTS/83_J_Code/code/app.html' whose
+    tail '83_J_Code/code' matches the sandbox but whose prefix is wrong, returns the
+    parts after the sandbox name (['app.html']); None if the tail does not match."""
+    for i in range(len(parts) - 1, 0, -1):
+        if parts[i] == SANDBOX.name and parts[i - 1] == SANDBOX.parent.name:
+            return parts[i + 1:]
+    return None
 
 # ----------------------------------------------------------------------- Tools
+# Generated/vendored folders: never listed or searched recursively (thousands of
+# files after 'npm install'), unless the model names them explicitly.
+# (upstream 2026-10-22, ma.4)
+SKIP_DIRS = {"node_modules", ".git", "__pycache__", ".venv", "venv", ".ruff_cache",
+             ".pytest_cache", ".mypy_cache", "dist", "build", ".DS_Store"}
+MAX_LIST = 300
+
+def _walk(base: Path):
+    """Files and dirs under base, skipping SKIP_DIRS; yields (path, skipped_dir_entry_count)."""
+    for p in sorted(base.rglob("*")):
+        rel = p.relative_to(base).parts
+        if any(part in SKIP_DIRS for part in rel[:-1]):
+            continue  # inside a skipped folder
+        if p.name in SKIP_DIRS:
+            if p.is_dir():
+                yield p, sum(1 for _ in p.rglob("*"))
+            continue
+        yield p, None
+
 def list_files(subdir: str = ".") -> str:
     base = _resolve(subdir)
     if not base.exists():
         return f"'{subdir}' does not exist."
     items = []
-    for p in sorted(base.rglob("*")):
+    for p, skipped in _walk(base):
         if not _inside_sandbox(p):  # FORK (security): no peeking through symlinks
             continue
-        tag = "[dir] " if p.is_dir() else "      "
-        items.append(tag + str(p.relative_to(SANDBOX)))
+        shown = str(p.relative_to(SANDBOX))
+        if skipped is not None:
+            items.append(f"[dir] {shown}  ({skipped} entries, not listed)")
+        else:
+            items.append(("[dir] " if p.is_dir() else "      ") + shown)
+    if len(items) > MAX_LIST:
+        items = items[:MAX_LIST] + [f"...[{len(items)} entries total - list a subfolder instead]"]
     return "\n".join(items) or "(empty)"
 
-def read_file(path: str, numbered: bool = False) -> str:
+def read_file(path: str, numbered: bool = False, start_line: int = 0, end_line: int = 0) -> str:
     p = _resolve(path)
     if not p.is_file():
         return f"File '{path}' not found. Use list_files() to see available files."
-    text = p.read_text(encoding="utf-8")
-    if numbered:
-        return "\n".join(
-            f"{i:4d}\u2502{line}" for i, line in enumerate(text.splitlines(), 1)
-        )
-    return text
+    try:
+        text = p.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return (f"'{path}' is a binary file ({p.stat().st_size} bytes). Images: use view_image, "
+                "PDFs: view_pdf_page, other binaries: inspect with run_command (e.g. 'file', 'xxd | head').")
+    if not (start_line or end_line or numbered):
+        return text  # verbatim (keeps trailing newline for edit_file copies)
+    lines = text.splitlines()
+    lo, hi = max(1, start_line or 1), min(len(lines), end_line or len(lines))
+    if lo > hi:
+        return f"Range {start_line}..{end_line} invalid - file has {len(lines)} lines."
+    sel = lines[lo - 1:hi]
+    out = "\n".join(f"{i:4d}\u2502{l}" for i, l in enumerate(sel, lo)) if numbered else "\n".join(sel)
+    if (lo, hi) != (1, len(lines)):
+        out += f"\n[lines {lo}-{hi} of {len(lines)}]"
+    return out
 
 def _inside_sandbox(path: Path) -> bool:
     """FORK (security): True if the path, after following symlinks, is in the sandbox."""
@@ -298,17 +369,21 @@ def search_files(pattern: str, glob: str = "**/*") -> str:
         rx = re.compile(pattern)
     except re.error as e:
         return f"ERROR: invalid regex: {e}"
-    # FORK (security): the original followed '..' in the glob and symlinks
-    # out of code/ - one call could send ~/.bashrc (with the API key) to the
-    # model. Only files that really lie inside the sandbox are read now.
-    if ".." in Path(glob).parts:
-        return "ERROR: '..' is not allowed in glob - it would leave the sandbox."
+    # FORK (security, ma.3; upstream has the same fix since 2026-10-22): no '..'
+    # and no absolute glob, and only files that really lie inside the sandbox -
+    # the original sent e.g. ~/.bashrc (with the API key) to the model.
+    glob = (glob or "**/*").strip()
+    if Path(glob).is_absolute() or ".." in Path(glob).parts:
+        return "ERROR: glob must be relative to the project and must not contain '..' (e.g. '**/*.py')."
     hits = []
-    for p in sorted(SANDBOX.glob(glob.lstrip("/") or "**/*")):
-        if not _inside_sandbox(p):
-            continue
+    named = set(Path(glob).parts) & SKIP_DIRS  # 'node_modules/**/*.js' searches it on purpose
+    for p in sorted(SANDBOX.glob(glob)):
         try:
-            text = p.read_text(encoding="utf-8") if p.is_file() else ""
+            if not p.is_file() or not _inside_sandbox(p):
+                continue  # directories, and symlinks pointing outside the project
+            if (set(p.relative_to(SANDBOX).parts[:-1]) & SKIP_DIRS) - named:
+                continue  # inside node_modules, .git, ... unless the glob names it
+            text = p.read_text(encoding="utf-8")
         except (UnicodeDecodeError, OSError):
             continue  # skip binary/unreadable files
         hits += [f"{p.relative_to(SANDBOX)}:{i}: {l.strip()[:200]}"
@@ -361,7 +436,7 @@ def _print_diff(old: str, new: str, path: str) -> None:
         print(f"\u2502    {DIM}... {hidden} more diff lines hidden ...{RESET}")
 
 def write_file(path: str, content: str) -> str:
-    p = _resolve(path)
+    p = _resolve(path, write=True)
     # FORK: write guard - executor only under reports/, verifier only under
     # the write_paths of settings.json, builder anywhere (as the original).
     allowed = CONFIG.write_dirs(MODE)
@@ -371,6 +446,12 @@ def write_file(path: str, content: str) -> str:
                 f"{folders} - '{path}' was refused, nothing written.")
     p.parent.mkdir(parents=True, exist_ok=True)
     old = p.read_text(encoding="utf-8") if p.is_file() else None
+    if old == content:
+        # upstream 2026-10-22 (ma.4): a no-op write is a symptom of a model going in
+        # circles - make it visible to the model (and to the failure-streak guard).
+        print(f"\u2502    {DIM}(no content change){RESET}")
+        return (f"WARNING: '{path}' already had exactly this content - nothing changed. "
+                "Do NOT write it again; it is done. Continue with the next step of the task.")
     p.write_text(content, encoding="utf-8")
     if old is None:
         # New file: no full dump as a green diff, just a short note.
@@ -400,10 +481,12 @@ def _find_close_match(needle: str, haystack: str) -> str:
             f"{repr(needle[:60])}. File has {len(haystack)} chars.")
 
 def edit_file(path: str, old_string: str, new_string: str) -> str:
-    p = _resolve(path)
+    p = _resolve(path, write=True)
     if not p.is_file():
         return f"File '{path}' not found."
     text = p.read_text(encoding="utf-8")
+    if old_string == new_string:  # upstream 2026-10-22 (ma.4)
+        return "ERROR: old_string and new_string are identical - nothing to change. Re-read the file; the text may already be as you want it."
     count = text.count(old_string)
     if count == 0:
         return "old_string not found - no change. " + _find_close_match(old_string, text)
@@ -416,7 +499,7 @@ def edit_file(path: str, old_string: str, new_string: str) -> str:
 
 def insert_lines(path: str, after_line: int, text: str) -> str:
     """Inserts text AFTER line after_line (1-based; 0 = at the beginning)."""
-    p = _resolve(path)
+    p = _resolve(path, write=True)
     if not p.is_file():
         return f"File '{path}' not found."
     old = p.read_text(encoding="utf-8")
@@ -437,7 +520,7 @@ def insert_lines(path: str, after_line: int, text: str) -> str:
 
 def delete_lines(path: str, start_line: int, end_line: int) -> str:
     """Deletes lines start_line..end_line (1-based, inclusive)."""
-    p = _resolve(path)
+    p = _resolve(path, write=True)
     if not p.is_file():
         return f"File '{path}' not found."
     old = p.read_text(encoding="utf-8")
@@ -464,40 +547,58 @@ _DANGEROUS = re.compile(r"""(?xi)
     | \b(curl|wget)\b[^|]*\|\s*(sudo\s+)?(ba)?sh\b # download piped into shell
 """)
 
+# Shell for run_command: bash wherever it exists. /bin/sh is dash on Debian/Ubuntu,
+# which lacks pipefail, [[ ]], source, {a,b}, echo -e and parses 'cmd &> f' as
+# 'cmd &' + '> f' - all things models write. Windows: cmd.exe (None = default).
+# (upstream 2026-10-22, ma.4; the cell binds / read-only, so the same path works inside)
+_SHELL = shutil.which("bash") if os.name != "nt" else None
+
 def run_command(command: str, timeout: int = CMD_TIMEOUT) -> str:
     """Runs a safe shell command with working directory = sandbox.
 
-    Any harmless command is allowed, including installing libraries
-    afterwards (e.g. 'pip install requests', 'npm install lodash').
     Destructive commands (rm -rf /, sudo, dd, mkfs, shutdown, ...) are
     blocked. Leading 'pip'/'pip3' calls are redirected to the running
-    Python interpreter so the library lands in jcode's environment.
+    Python interpreter. Upstream 2026-10-22 (ma.4): bash with pipefail for
+    pipes, own process group, and on a timeout the whole process tree is
+    killed and the output until then is returned.
     """
     if (m := _DANGEROUS.search(command)) is not None:
         return ("ERROR: command blocked - dangerous pattern "
                 f"{m.group(0).strip()!r}. Only safe commands are allowed.")
-    command = re.sub(r"^\s*pip3?\b", f"{sys.executable} -m pip", command)
+    shown = command  # what the model wrote - used in messages
+    # quoted: an interpreter path with spaces ('.../My Projects/.venv/bin/python') must stay one word
+    command = re.sub(r"^\s*pip3?\b", lambda _: f"{shlex.quote(sys.executable)} -m pip", command)
+    if _SHELL and "|" in command:
+        # 'node test.js | head' must report test.js's exit code, not head's
+        command = "set -o pipefail; " + command
     timeout = max(1, min(int(timeout), MAX_CMD_TIMEOUT))  # FORK: cap from settings.json
     try:
         args, shell, env = _command_process(command)  # FORK (E7): cell if enabled
     except CellError as e:
         return f"ERROR: cell: {e} - nothing was run."
+    proc = subprocess.Popen(
+        args, shell=shell, executable=_SHELL if shell else None, cwd=SANDBOX, text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        env=env,  # FORK (E4): no API keys in the shell
+        start_new_session=True,  # own process group: a timeout kills the whole tree (node, chrome, ...)
+    )
+    timed_out = False
     try:
-        proc = subprocess.run(
-            args,
-            shell=shell,
-            cwd=SANDBOX,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            env=env,  # FORK (E4): no API keys in the shell
-        )
+        stdout, stderr = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
-        return f"TIMEOUT after {timeout}s: {command!r}"
-    stdout, stderr = (proc.stdout or "").strip(), (proc.stderr or "").strip()
+        timed_out = True
+        try:
+            os.killpg(proc.pid, signal.SIGKILL) if os.name != "nt" else proc.kill()
+        except OSError:
+            pass
+        stdout, stderr = proc.communicate()  # partial output is still valuable
+    stdout, stderr = (stdout or "").strip(), (stderr or "").strip()
     out = (f"stdout:\n{stdout}\nstderr:\n{stderr}" if stdout and stderr else stdout or stderr or "(no output)")
     if len(out) > 4000:  # save context
         out = out[:2000] + "\n...[truncated]...\n" + out[-2000:]
+    if timed_out:
+        return (f"TIMEOUT after {timeout}s: {shown!r} - process tree killed. "
+                f"Output until then:\n{out}")
     return f"exit_code={proc.returncode}\n{out}"
 
 def _command_env() -> dict:
@@ -509,14 +610,14 @@ def _command_env() -> dict:
 def _command_process(command: str) -> tuple:
     """FORK (E7): (args, shell, env) for subprocess.run. Without a cell as
     before: /bin/sh -c in code/ with the E4 environment. With a cell:
-    bwrap ... -- /bin/sh -c <command>; inside, only the cell's short variable
+    bwrap ... -- bash -c <command> (ma.4: was /bin/sh); inside, only the cell's short variable
     list (taken from the E4 environment); bwrap itself starts with LAUNCH_ENV
     (it is process 1 in the cell and its environment is readable there).
     The cell has its own PID namespace, so a timeout also ends every
     process the command left running in the background."""
     if not CELL.enabled:
         return command, True, _command_env()
-    argv, _notes = build_argv(CELL, command=["/bin/sh", "-c", command], workdir=SANDBOX,
+    argv, _notes = build_argv(CELL, command=[_SHELL or "/bin/sh", "-c", command], workdir=SANDBOX,
                               environ=_command_env(), passthrough=CONFIG.env_passthrough,
                               bwrap=_BWRAP)
     return argv, False, dict(LAUNCH_ENV)
@@ -545,8 +646,10 @@ def _cell_note() -> str:
     """FORK (E7): one line for the start screen."""
     if not CELL.enabled:
         return "off (run_command sees the whole home folder)"
-    return (f"ON (bubblewrap): only code/ writable, {len(CELL.read_only)} read-only "
-            f"path(s), empty home folder")
+    inside = ("code/ writable except " + ", ".join(f"{p}/" for p in CELL.read_only_in_workdir)
+              if CELL.read_only_in_workdir else "only code/ writable")  # FORK (ma.5)
+    return (f"ON (bubblewrap): {inside}, {len(CELL.read_only)} read-only "
+            f"path(s), empty home folder{'' if CELL.network else ', no network'}")
 
 def web_search(query: str, max_results: int = 5) -> str:
     """Web search via DuckDuckGo; returns title, URL and snippet of the hits."""
@@ -781,6 +884,22 @@ def _prune_images(messages: list) -> None:
                 if seen > MAX_IMAGES_IN_CONTEXT:
                     part.clear(); part.update({"type": "text", "text": "[older image removed from context]"})
 
+def _has_images(messages: list) -> bool:
+    """upstream 2026-10-22 (ma.4)."""
+    return any(isinstance(m.get("content"), list) and any(p.get("type") == "image_url" for p in m["content"])
+               for m in messages)
+
+def _strip_images(messages: list) -> int:
+    """Replaces every image part by a text stub (model/server without vision). Returns the count.
+    upstream 2026-10-22 (ma.4)."""
+    n = 0
+    for m in messages:
+        if isinstance(m.get("content"), list):
+            for part in m["content"]:
+                if part.get("type") == "image_url":
+                    part.clear(); part.update({"type": "text", "text": "[image removed - not supported by the model]"}); n += 1
+    return n
+
 def _content_text(content) -> str:
     """Text view of a message content (image parts become '[image]')."""
     if isinstance(content, list):
@@ -819,7 +938,9 @@ _TOOL_META = {
             "and copy old_string verbatim from the result; never include line "
             "numbers in old_string."
         ),
-        "params": {"numbered": "Show line numbers, default false"},
+        "params": {"numbered": "Show line numbers, default false",
+                   "start_line": "First line to return (1-based); use with end_line to read only the region around a search_files hit instead of the whole file",
+                   "end_line": "Last line to return (inclusive)"},
     },
     "search_files": {
         "description": ("Searches all sandbox files line by line with a Python regex; "
@@ -859,10 +980,12 @@ _TOOL_META = {
         "description": (
             "Runs a safe shell command in the 'code' directory and returns "
             "exit_code, stdout and stderr. For smoke tests/tests (e.g. "
-            "'python -m pytest -q') AND for installing missing libraries "
-            "(e.g. 'pip install requests', 'npm install lodash'). "
+            "'python -m pytest -q'). "
+            # FORK (ma.4): upstream also offered it for installing libraries.
             "Destructive commands (rm -rf /, sudo, dd, mkfs, shutdown, ...) "
-            "are blocked."
+            "are blocked. Background processes (servers, GUIs) MUST redirect "
+            "their output and be detached ('cmd > x.log 2>&1 &'), otherwise "
+            "the call blocks until the timeout."
             # FORK (E7): tell the model what the cell means for it.
             + (" The command runs in an isolated cell: only the 'code' directory "
                "is writable, the home folder is empty and nothing can be installed "
@@ -1058,7 +1181,7 @@ def _action_label(name: str, args: dict) -> str:
 
 # Compact result status - never output file content or code.
 def _result_label(name: str, result: str) -> str:
-    if result.startswith("ERROR"):
+    if result.startswith(("ERROR", "WARNING")):
         return "   \u2717 " + result.replace("\n", " ")[:120]
     if name == "run_command":
         first = result.splitlines()[0] if result else ""
@@ -1077,9 +1200,27 @@ def _result_label(name: str, result: str) -> str:
         return f"   \u2713 {len([l for l in result.splitlines() if l.strip()])} entries"
     return "   \u2713 " + result.replace("\n", " ")[:100]
 
+def _error_key(name: str, result: str) -> tuple[str, str] | None:
+    """(tool, error class) for a failed tool result, None for a successful one.
+    Quoted strings and numbers are masked, so "'probe1.js' is outside the project"
+    and "'probe2.js' is outside the project" count as the same error.
+    upstream 2026-10-22 (ma.4)."""
+    first = result.splitlines()[0] if result else ""
+    if first.startswith("WARNING: identical call") or first.startswith("WARNING: this is failure"):
+        first = next((l for l in result.splitlines()[1:] if l.strip()), "")  # our own guard prefixes
+    if not (first.startswith(("ERROR", "WARNING", "TIMEOUT")) or "not found" in first):
+        return None
+    masked = re.sub(r"'[^']*'|\"[^\"]*\"", "'...'", first)
+    masked = re.sub(r"\d+", "N", masked)[:160]
+    return (name, masked)
+
 # ------------------------------------------------------------- LLM with retry
 class LLMUnavailable(Exception):
     """All retry attempts against LM Studio have failed."""
+
+class LLMRejected(Exception):
+    """The server rejected the request itself (4xx): retrying can't help.
+    upstream 2026-10-22 (ma.4)."""
 
 def _effective_reasoning() -> str | None:
     """FORK: /reasoning wins; otherwise the active chain entry's setting."""
@@ -1130,6 +1271,8 @@ def _chat(**kwargs):
     On errors (server unreachable, timeout, model still loading, 5xx) it
     retries with growing wait times. If all attempts fail, LLMUnavailable is
     raised - the caller decides how to handle it (the session is preserved).
+    A 4xx answer (bad request: context too long, images not supported, invalid
+    tool schema, ...) is raised at once as LLMRejected.
 
     FORK: model and reasoning effort are set here on every attempt, so a
     model switch takes effect immediately. An HTTP 429 for a daily quota
@@ -1149,6 +1292,12 @@ def _chat(**kwargs):
         except KeyboardInterrupt:
             raise  # never swallow Ctrl+C
         except Exception as e:  # noqa: BLE001
+            # upstream 2026-10-22 (ma.4): a 4xx other than 408/409/429 is not retried.
+            # FORK: 429 keeps going to the model fallback below.
+            status = getattr(e, "status_code", None)
+            if status and 400 <= status < 500 and status not in (408, 409, 429):
+                _log("### Request rejected", str(e))
+                raise LLMRejected(str(e)) from e
             last_err = e
             limit = classify_rate_limit(e)
             if limit == "daily" or (limit and attempt == attempts):
@@ -1323,6 +1472,29 @@ def print_status(messages: list) -> None:
     print(f"   Model     : {MODEL}")
     print(f"   Sandbox   : {SANDBOX}")
 
+def _stats_line(usage, msg, elapsed: float) -> str:
+    """Time / generated tokens / tokens per second for one LLM response.
+
+    Uses usage.completion_tokens from the server if present; otherwise
+    approximates with ~4 characters per token over content + tool-call
+    arguments (then marked with '~'). upstream 2026-10-22 (ma.4).
+    """
+    tokens = getattr(usage, "completion_tokens", None) if usage else None
+    exact = bool(tokens)
+    if not exact:
+        chars = len(msg.content or "")
+        for tc in msg.tool_calls or []:
+            chars += len(tc.function.name or "") + len(tc.function.arguments or "")
+        tokens = max(1, chars // 4)
+    tps = tokens / elapsed if elapsed > 0 else 0.0
+    approx = "" if exact else "~"
+    line = (f"\u23f1 {elapsed:.1f}s | {approx}{tokens:,} tokens | "
+            f"{approx}{tps:.1f} tok/s")
+    if (ctx := getattr(usage, "prompt_tokens", None) if usage else None):
+        line += f" | context {ctx:,}"  # what the server actually received - compare with its context length
+    _log("### Stats", line)
+    return f"{DIM}{line}{RESET}"
+
 def new_session() -> list:
     """Starts a fresh session history (system prompt only)."""
     global _REQ_NR, LOG_FILE
@@ -1398,10 +1570,24 @@ def run(task: str, messages: list) -> list:
     first model if its quota is available again, and checks git afterwards,
     also when the task is aborted with Ctrl+C."""
     _restore_primary_if_possible()
+    reports_dir = SANDBOX / REPORTS_DIR_NAME
+    before = report_names(reports_dir)
     try:
         return _run_steps(task, messages)
     finally:
+        _name_reports_after_model(reports_dir, before)
         _report_sandbox_changes()
+
+def _name_reports_after_model(reports_dir: Path, before: set) -> None:
+    """FORK (ma.5): with report_model_suffix, the reports this task wrote get
+    the model in their name (reports/<task>__<model>.md): the model in use
+    when the task ended, which is the only one if fallback_same_provider and
+    a single-model chain keep it from changing."""
+    if not CONFIG.report_model_suffix:
+        return
+    for old, new in add_model_suffix(reports_dir, before, MODEL):
+        print(f"{DIM}   report renamed: reports/{old} -> reports/{new}{RESET}")
+        _log("### Report renamed", f"{old} -> {new} (model {BACKEND}/{MODEL})")
 
 def _run_steps(task: str, messages: list) -> list:
     """Runs a task on the (session-wide) history.
@@ -1415,6 +1601,13 @@ def _run_steps(task: str, messages: list) -> list:
     _log("### Task (user)", task)
 
     last_total_tokens = 0
+    # upstream 2026-10-22 (ma.4): guard against identical tool calls, compared with the
+    # last REPEAT_WINDOW calls, so A-B-A-B cycles count too.
+    recent_calls, repeats, nudged = collections.deque(maxlen=REPEAT_WINDOW), 0, False
+    # Second guard: the same tool failing with the same KIND of error, even with different
+    # arguments (e.g. write_file with 20 different file names in a wrong directory).
+    fail_key, fail_streak, fail_nudged = None, 0, False
+    rejected_once = False  # one recovery attempt (strip images / compact) per request
     for step in range(1, MAX_STEPS + 1):
         # Check the context: prefer the real usage values of the last
         # response, otherwise the character heuristic. Compact on overflow.
@@ -1432,13 +1625,36 @@ def _run_steps(task: str, messages: list) -> list:
                  f"{_content_text(messages[-1].get('content'))[:300]}")
             # FORK: tools depend on the mode; model and reasoning effort are
             # filled in by _chat (they can change during a model fallback).
+            t_start = time.perf_counter()
             resp = _chat(messages=messages, tools=_active_tools(), temperature=0.2)
+            elapsed = time.perf_counter() - t_start
         except LLMUnavailable as e:
             _log("### Error", str(e))
             print(f"\n{RED}\u2717 {e}{RESET}")
             print("  The session is preserved - check whether the "
                   f"{BACKEND} server is running, then submit the task again.")
             return messages
+        except LLMRejected as e:  # upstream 2026-10-22 (ma.4)
+            err = str(e).lower()
+            if _has_images(messages) and not rejected_once:
+                # Model/server without vision: drop the images and carry on text-only.
+                rejected_once = True
+                n = _strip_images(messages)
+                print(f"\n{DIM}\u26a0\ufe0f  {BACKEND} rejected the request with images "
+                      f"({n} removed) - continuing text-only.{RESET}")
+                messages.append({"role": "user", "content":
+                    "[The model cannot see images. The image(s) above were removed - "
+                    "verify visually in another way, e.g. by asserting on state or pixels in a test.]"})
+                continue
+            if "context" in err and not rejected_once:
+                rejected_once = True  # context too long: compact now, try once more
+                messages[:] = _compact_messages(messages); last_total_tokens = LAST_USAGE_TOKENS = 0
+                continue
+            _log("### Error", str(e))
+            print(f"\n{RED}\u2717 {BACKEND} rejected the request: {str(e)[:400]}{RESET}")
+            print("  The session is preserved - fix the cause (model/context settings) and submit the task again.")
+            return messages
+        rejected_once = False
         usage = getattr(resp, "usage", None)
         if usage and getattr(usage, "total_tokens", None):
             last_total_tokens = usage.total_tokens
@@ -1459,6 +1675,7 @@ def _run_steps(task: str, messages: list) -> list:
             _log("### LLM response", plan or "(tool calls only)")
         if plan:
             print(f"\n\U0001f9e0 {plan}")
+        print(_stats_line(usage, msg, elapsed))  # upstream 2026-10-22 (ma.4)
 
         if not msg.tool_calls:
             if plan:
@@ -1482,6 +1699,43 @@ def _run_steps(task: str, messages: list) -> list:
                     result = TOOL_FUNCS[name](**args)
             except Exception as e:  # noqa: BLE001
                 result = f"ERROR: {e}"
+            # upstream 2026-10-22 (ma.4) - loop guard: same tool, same arguments AND same
+            # result as one of the recent calls (re-running a test after an edit is fine).
+            call = (name, tc.function.arguments, str(result))
+            repeats = repeats + 1 if call in recent_calls else 0
+            recent_calls.append(call)
+            if repeats >= MAX_REPEATS:
+                while messages[-1].get("role") == "tool":
+                    messages.pop()
+                messages.pop()  # drop the stuck round so the history stays well-formed
+                if not nudged:  # first time: force a reflection step instead of more tool calls
+                    nudged, repeats = True, 0
+                    recent_calls.clear()
+                    fail_streak = 0  # don't inject a second reflection message for the same round
+                    _log("### Loop detected", f"`{name}` repeated with identical result - reflection step injected")
+                    print(f"\u2502  {DIM}\u26a0\ufe0f  Loop detected ({name} x{MAX_REPEATS + 1}, identical result) - asking the model to rethink.{RESET}")
+                    messages.append({"role": "user", "content": (
+                        f"STOP. You called {name} with identical arguments {MAX_REPEATS + 1} times within the "
+                        f"last few steps and got the identical result every time:\n{str(result)[:300]}\n"
+                        "Repeating it cannot produce new information. Before any further tool call, "
+                        "answer in text: (1) what did you expect, (2) what did you actually observe, "
+                        "(3) three different hypotheses for the difference, (4) the ONE cheapest "
+                        "experiment that distinguishes them. Then run exactly that experiment.")})
+                    break
+                print(f"\u2514\u2500\n{RED}\u2717 Task stopped: the same tool call was repeated again "
+                      f"after a warning - the model is stuck. The session is preserved.{RESET}")
+                _log("### Error", f"identical tool call `{name}` repeated {repeats + 1}x - task stopped")
+                return messages
+            if repeats:
+                result = (f"WARNING: identical call #{repeats + 1} in a row with the identical result. "
+                          f"Do NOT repeat it; explain the problem and take a different step.\n{result}")
+            # Failure streak: same tool, same error class (paths/numbers masked), any arguments.
+            key = _error_key(name, str(result))
+            fail_streak = fail_streak + 1 if (key and key == fail_key) else (1 if key else 0)
+            fail_key = key
+            if fail_streak >= MAX_REPEATS and fail_streak % MAX_REPEATS == 0 and not fail_nudged:
+                result = (f"WARNING: this is failure #{fail_streak} of {name} in a row with the same "
+                          f"kind of error. Changing the arguments slightly will not help.\n{result}")
             _log("### Tool response", str(result))
             print("\u2502  " + _result_label(name, str(result)))
             messages.append(
@@ -1489,6 +1743,25 @@ def _run_steps(task: str, messages: list) -> list:
             )
         if _PENDING_IMAGES:
             messages.append(_image_message())
+        if fail_streak >= MAX_REPEATS:
+            # Appended AFTER the complete tool round, so the assistant/tool pairs stay intact.
+            if fail_nudged:
+                print(f"\u2514\u2500\n{RED}\u2717 Task stopped: {fail_key[0]} failed {fail_streak}x in a row "
+                      f"with the same kind of error after a warning - the model is stuck. "
+                      f"The session is preserved.{RESET}")
+                _log("### Error", f"`{fail_key[0]}` failed {fail_streak}x in a row ({fail_key[1]}) - task stopped")
+                return messages
+            fail_nudged, fail_streak = True, 0
+            _log("### Failure streak", f"`{fail_key[0]}` failed {MAX_REPEATS}x in a row: {fail_key[1]} - reflection step injected")
+            print(f"\u2502  {DIM}\u26a0\ufe0f  {fail_key[0]} failed {MAX_REPEATS}x in a row with the same error - asking the model to rethink.{RESET}")
+            messages.append({"role": "user", "content": (
+                f"STOP. Your last {MAX_REPEATS} calls of {fail_key[0]} ALL failed with the same kind "
+                f"of error:\n{fail_key[1]}\n"
+                "Varying the arguments (another file name, another number) will not help - the "
+                "error is elsewhere. Read the error message literally. Paths: the project "
+                "directory is the current working directory; give paths RELATIVE to it, e.g. "
+                "'app.html' or 'tests/test_x.js', never absolute. Before the next tool call, "
+                "state in one sentence what was wrong and what you will do differently.")})
         print("\u2514\u2500")
 
     print("Maximum number of steps reached.")
@@ -1525,6 +1798,10 @@ def _set_mode(name: str) -> list | None:
     if mode is None:
         print(f"{RED}\u2717 Use: /mode {'|'.join(CONFIG.modes)} "
               f"(or ejecutor|constructor|verificador){RESET}")
+        return None
+    if mode not in CONFIG.modes:  # FORK (ma.5): allowed_modes in settings.json
+        print(f"{RED}\u2717 Mode {mode} is not allowed in this project "
+              f"(allowed_modes: {', '.join(CONFIG.modes)}).{RESET}")
         return None
     MODE, MAX_STEPS, LAST_USAGE_TOKENS = mode, CONFIG.max_steps[mode], 0
     print(f"{YELLOW}Mode: {MODE.upper()} - max steps {MAX_STEPS}, "

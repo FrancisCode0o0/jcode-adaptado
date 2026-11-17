@@ -203,9 +203,10 @@ def test_chain_entry_tightens_threshold(jc):
 
 
 # ------------------------------------------------------------- run_command
-def test_run_command_timeout_capped_by_settings(jc):
+def test_run_command_timeout_capped_by_settings(jc, monkeypatch):
     # A requested timeout above max_command_timeout_s is cut down to it.
-    jc.mod.MAX_CMD_TIMEOUT = 1
+    # (ma.4: monkeypatch, so the cap of 1 s does not leak into later tests)
+    monkeypatch.setattr(jc.mod, "MAX_CMD_TIMEOUT", 1)
     start = time.monotonic()
     result = jc.mod.run_command("sleep 5", timeout=9999)
     assert result.startswith("TIMEOUT after 1s") and time.monotonic() - start < 4

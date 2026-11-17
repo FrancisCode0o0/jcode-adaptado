@@ -22,13 +22,14 @@ effects at import time, so every piece is testable on its own:
     FallbackChain       which model to try next when a daily quota is gone
     sanitized_env       environment for run_command without secrets (E4)
     git_changes         files changed in the sandbox outside the allowed dirs
+    add_model_suffix    reports/<task>__<model>.md (ma.5, Reliquia review)
 """
 from __future__ import annotations
 
 import re
 import subprocess
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timezone
 from pathlib import Path, PurePosixPath
 
@@ -226,6 +227,11 @@ class Config:
     verifier_write_paths: tuple[str, ...] = ()  # empty = no verifier mode
     fallback_exhausted: str = FALLBACK_DEFAULT
     env_passthrough: tuple[str, ...] = ()
+    # ma.5 (Reliquia review): a quota fallback never leaves the provider in
+    # use, so every report comes from one model family.
+    fallback_same_provider: bool = False
+    # ma.5: reports written in a task get '__<model>' in their file name.
+    report_model_suffix: bool = False
 
     @property
     def modes(self) -> tuple[str, ...]:
@@ -364,6 +370,7 @@ def load_config(settings: dict) -> tuple[Config, list[str]]:
     raw_modes = settings.get("modes") if isinstance(settings.get("modes"), dict) else {}
     write_paths = _parse_verifier(raw_modes, warnings)
     modes = (EXECUTOR, BUILDER) + ((VERIFIER,) if write_paths else ())
+    modes = _parse_allowed_modes(settings.get("allowed_modes"), modes, warnings)
     mode = MODE_ALIASES.get(str(settings.get("default_mode", EXECUTOR)).lower())
     if mode not in modes:
         warnings.append(f"default_mode={settings.get('default_mode')!r} unknown or not "
@@ -383,8 +390,78 @@ def load_config(settings: dict) -> tuple[Config, list[str]]:
         verifier_write_paths=write_paths,
         fallback_exhausted=_parse_fallback_exhausted(settings, chain, warnings),
         env_passthrough=_parse_env_passthrough(settings.get("env_passthrough"), warnings),
+        fallback_same_provider=_parse_bool(settings, "fallback_same_provider", warnings),
+        report_model_suffix=_parse_bool(settings, "report_model_suffix", warnings),
     )
+    if mode not in config.modes:  # allowed_modes removed the default mode
+        config = replace(config, default_mode=config.modes[0])
     return config, warnings
+
+
+def _parse_allowed_modes(raw, modes: tuple[str, ...], warnings: list[str]) -> tuple[str, ...]:
+    """ma.5: 'allowed_modes': ["executor"] limits /mode to those modes (a
+    read-only review must not be one '/mode builder' away from editing).
+    Missing = every configured mode; nothing valid = executor alone."""
+    if raw is None:
+        return modes
+    if not isinstance(raw, list):
+        warnings.append("allowed_modes must be a list like [\"executor\"] - using executor only")
+        return (EXECUTOR,)
+    allowed = []
+    for item in raw:
+        mode = MODE_ALIASES.get(str(item).lower())
+        if mode not in modes:
+            warnings.append(f"allowed_modes: {item!r} is not a configured mode - ignored")
+        elif mode not in allowed:
+            allowed.append(mode)
+    if not allowed:
+        warnings.append("allowed_modes has no valid mode - using executor only")
+        return (EXECUTOR,)
+    return tuple(m for m in modes if m in allowed)  # keep the usual order
+
+
+def _parse_bool(settings: dict, name: str, warnings: list[str]) -> bool:
+    value = settings.get(name, False)
+    if isinstance(value, bool):
+        return value
+    warnings.append(f"{name}={value!r} must be true or false - using false")
+    return False
+
+
+def model_slug(model: str) -> str:
+    """ma.5: a model id as a file-name part: 'qwen/qwen3-coder:free' ->
+    'qwen-qwen3-coder-free'."""
+    slug = re.sub(r"[^A-Za-z0-9.]+", "-", model).strip("-.")
+    return slug or "model"
+
+
+def add_model_suffix(reports_dir: Path, before: set[str], model: str) -> list[tuple[str, str]]:
+    """ma.5: renames the files that appeared in reports/ during a task to
+    '<name>__<model><ext>' (unless they already carry that suffix), so each
+    report says which model wrote it. Never overwrites: an existing target
+    gets '-2', '-3'... Returns (old name, new name) pairs."""
+    if not reports_dir.is_dir():
+        return []
+    marker = f"__{model_slug(model)}"
+    renamed = []
+    for path in sorted(reports_dir.iterdir()):
+        if path.name in before or not path.is_file() or path.is_symlink():
+            continue
+        if path.stem.endswith(marker):
+            continue
+        target = reports_dir / f"{path.stem}{marker}{path.suffix}"
+        number = 2
+        while target.exists():
+            target = reports_dir / f"{path.stem}{marker}-{number}{path.suffix}"
+            number += 1
+        path.rename(target)
+        renamed.append((path.name, target.name))
+    return renamed
+
+
+def report_names(reports_dir: Path) -> set[str]:
+    """Names in reports/ before a task (empty if the folder does not exist)."""
+    return {p.name for p in reports_dir.iterdir()} if reports_dir.is_dir() else set()
 
 
 def resolve_mode(name: str) -> str | None:
@@ -474,9 +551,11 @@ class FallbackChain:
     becomes available again (the caller switches back to the first one).
     """
 
-    def __init__(self, entries: tuple[ChainEntry, ...], day_fn=quota_day) -> None:
+    def __init__(self, entries: tuple[ChainEntry, ...], day_fn=quota_day,
+                 same_provider: bool = False) -> None:
         self.entries = entries
         self._day_fn = day_fn
+        self._same_provider = same_provider  # ma.5: never switch to another provider
         self._exhausted: dict[tuple[str, str], date] = {}
 
     def mark_exhausted(self, provider: str, model: str) -> None:
@@ -490,9 +569,11 @@ class FallbackChain:
                      if (e.provider, e.model) == (provider, model)), None)
 
     def next_entry(self, provider: str, model: str) -> ChainEntry | None:
-        """First usable entry in chain order that is not the current model."""
+        """First usable entry in chain order that is not the current model
+        (ma.5: with same_provider, only entries of the current provider)."""
         return next((e for e in self.entries
                      if (e.provider, e.model) != (provider, model)
+                     and not (self._same_provider and e.provider != provider)
                      and not self.is_exhausted(e)), None)
 
     def first_available(self) -> ChainEntry | None:

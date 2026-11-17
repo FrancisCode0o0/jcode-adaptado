@@ -1,6 +1,6 @@
 --- upstream/jcode.py
 +++ fork/jcode.py
-@@ -1,13 +1,26 @@
+@@ -1,17 +1,32 @@
  #!/usr/bin/env python3
  # MIT License - Copyright (c) 2026 Prof. Dr. Joern Fischer (full text: see README.md)
 +# Adapted for the mejorador-audio and Abschrift projects (c) 2026 Francis Garcia Reyes,
@@ -8,35 +8,45 @@
  """jcode - minimal coding agent for local LLMs, sandboxed to ./code.
 -Setup, usage and configuration: see README.md."""
 +Setup, usage and configuration: see README.md.
-+
-+This fork (based on the 'multimodal' branch, commit b37d004cb7) adds an
+ 
+-import collections
++This fork (based on the 'multimodal' branch, commit b37d004cb7, plus parts
++of upstream's jcode.py of 2026-10-22 since 0.10.0-ma.4) adds an
 +'executor' mode, automatic model fallback on exhausted daily quotas,
 +settings.json-driven limits and a git check after every task; for Abschrift
 +also '--project <folder>', a 'verifier' mode, 'fallback_exhausted: stop' and
 +a run_command environment without secrets; for both projects an optional
 +bubblewrap cell for run_command ("sandbox" in settings.json, 0.10.0-ma.3,
-+module jcode_cell.py). Every change is marked with
++module jcode_cell.py); since 0.10.0-ma.5 'allowed_modes',
++'fallback_same_provider' and 'report_model_suffix' (read-only review of
++La Reliquia del Alba). Every change is marked with
 +'FORK:' and listed in README.md; the new logic itself lives in
 +jcode_extras.py."""
- 
++
++import collections  # ma.4 (upstream 2026-10-22): loop guard window
  import difflib
  import inspect
  import json
  import os
  import re
+-import shlex
+-import shutil
+-import signal
++import shlex  # ma.4 (upstream 2026-10-22): quote the interpreter path for pip
 +import shutil  # FORK (E7): find bwrap
++import signal  # ma.4 (upstream 2026-10-22): kill the whole process tree on timeout
  import subprocess
  import sys
  import time
-@@ -25,9 +38,20 @@
+@@ -29,10 +44,21 @@
  
  from openai import OpenAI
  
 +from jcode_extras import (  # FORK: additions for mejorador-audio and Abschrift
 +    BUILDER, EXECUTOR, EXECUTOR_PROMPT, EXECUTOR_TOOL_NAMES, FALLBACK_STOP,
 +    REPORTS_DIR_NAME, SETTINGS_FILE_NAME, VERIFIER, VERIFIER_TOOL_NAMES,
-+    FallbackChain, classify_rate_limit, git_changes, is_under_any,
-+    load_config, parse_cli_args, resolve_mode, retry_delay_seconds,
++    FallbackChain, add_model_suffix, classify_rate_limit, git_changes, is_under_any,
++    load_config, parse_cli_args, report_names, resolve_mode, retry_delay_seconds,
 +    sanitized_env, verifier_prompt,
 +)
 +from jcode_cell import (  # FORK (E7): run_command inside a bubblewrap cell
@@ -46,11 +56,13 @@
  # --------------------------------------------------------------- Configuration
  APP_NAME = "jcode"
 -APP_VERSION = "0.10.0"
-+APP_VERSION = "0.10.0-ma.3"  # FORK: upstream 0.10.0 + adaptation 3 (mejorador-audio, Abschrift)
- DEFAULT_MODEL = "qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive"
+-DEFAULT_MODEL = "qwen3.8-27b-splash" #"qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive"
++APP_VERSION = "0.10.0-ma.6"  # FORK: upstream 0.10.0 (2026-10-22) + adaptation 6 (mejorador-audio, Abschrift, Reliquia review)
++DEFAULT_MODEL = "qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive"
  MODEL = DEFAULT_MODEL
  
-@@ -55,7 +79,19 @@
+ _LM_STUDIO_URL = "http://localhost:1234/v1"
+@@ -59,24 +85,33 @@
              if match(m): return m
      return models[0]
  
@@ -69,12 +81,23 @@
 +BASE_DIR = PROJECT_DIR or APP_DIR
 +SETTINGS_FILE = BASE_DIR / SETTINGS_FILE_NAME
  def _load_settings() -> dict:
-     """Reads settings.json: providers (OpenAI/Anthropic/Gemini via OpenAI-compatible endpoints) for '/backend <name>'."""
+-    """Reads settings.json: providers (OpenAI/Anthropic/Gemini via OpenAI-compatible endpoints) for '/backend <name>',
+-    plus Claude-Code-style "autoCompactEnabled" (bool) and "autoCompactWindow" (e.g. "256k")."""
++    """Reads settings.json: providers (OpenAI/Anthropic/Gemini via OpenAI-compatible endpoints) for '/backend <name>'."""
      try:
-@@ -63,6 +99,13 @@
+         return json.loads(SETTINGS_FILE.read_text(encoding="utf-8")) if SETTINGS_FILE.is_file() else {}
      except Exception as e:  # noqa: BLE001
          print(f"WARNING: settings.json ignored ({e})", file=sys.stderr); return {}
  SETTINGS = _load_settings()
+-
+-def _parse_tokens(value, default: int) -> int:
+-    """'256k' / '1m' / 250000 -> token count (Claude Code 'autoCompactWindow' notation)."""
+-    s = str(value if value is not None else default).strip().lower()
+-    mult = {"k": 1_000, "m": 1_000_000}.get(s[-1:], 1)
+-    try:
+-        return int(float(s.rstrip("km")) * mult)
+-    except ValueError:
+-        print(f"WARNING: autoCompactWindow {value!r} ignored", file=sys.stderr); return default
 +CONFIG, _CONFIG_WARNINGS = load_config(SETTINGS)  # FORK: new settings.json keys
 +# FORK (E7): "sandbox" section - run_command inside a bubblewrap cell.
 +_CELL_WARNINGS: list[str] = []
@@ -85,7 +108,7 @@
  
  def _detect_backend() -> tuple[str, str, str]:
      """Tries LM Studio (port 1234) first, Ollama (port 11434) as fallback."""
-@@ -77,15 +120,29 @@
+@@ -91,15 +126,29 @@
  
  BASE_URL, _API_KEY, BACKEND = _detect_backend()
  
@@ -122,7 +145,7 @@
      url       = _OLLAMA_URL if "ollama" in name.lower() else _LM_STUDIO_URL
      key, bname = ("ollama", "Ollama") if url == _OLLAMA_URL else ("lm-studio", "LM Studio")
      models = _fetch_models(url)
-@@ -95,21 +152,34 @@
+@@ -109,26 +158,36 @@
      client = OpenAI(base_url=BASE_URL, api_key=_API_KEY, timeout=REQUEST_TIMEOUT, max_retries=0)
      print(f"{DIM}Backend: {BACKEND} ({BASE_URL}) | Model: {MODEL}{RESET}")
  
@@ -133,16 +156,22 @@
 +# (executor 15, builder 40 by default); /mode and /max-turns change them.
 +MODE = CONFIG.default_mode
 +MAX_STEPS = CONFIG.max_steps[MODE]
+ MAX_REPEATS = 3   # identical tool calls (within REPEAT_WINDOW) or same-error failures before a reflection step; twice = stop
+ REPEAT_WINDOW = 10  # how many recent tool calls an identical call is compared against (catches A-B-A-B cycles)
  CMD_TIMEOUT = 60  # seconds per command (compiling C/C++/Java takes time)
 +MAX_CMD_TIMEOUT = CONFIG.max_command_timeout  # FORK: cap for the per-call timeout
  CONTEXT_LIMIT = 256_000       # context window of the model (tokens)
--COMPACT_THRESHOLD = 250_000   # history is compacted from here on
+-COMPACT_THRESHOLD = _parse_tokens(SETTINGS.get("autoCompactWindow"), 250_000)  # history is compacted from here on
+-AUTO_COMPACT = bool(SETTINGS.get("autoCompactEnabled", True))                  # false = never compact
+-INLINE_SKILLS = bool(SETTINGS.get("inlineSkills", False))  # true = full SKILL.md texts in the system prompt (models that ignore the catalog)
 +COMPACT_THRESHOLD = CONFIG.compact_threshold  # FORK: ~60 K by default (was 250 K)
  KEEP_RECENT = 8               # most recent messages kept uncompressed
  REQUEST_TIMEOUT = 11600         # seconds per LLM request (local models are slow)
  RETRY_WAITS = (5, 15, 30, 60)  # wait times between retry attempts
- REASONING_EFFORT = None  # None = backend default; else "high"|"medium"|"low"|"max"|"none" (Ollama /v1)
+-REASONING_EFFORT = "medium"  # "high"|"medium"|"low"|"max"|"none" (Ollama /v1); None = backend default ('/reasoning default')
+-TEMPERATURE = 0.3  # sampling temperature for the agent loop; 0.7 made small models "try another file name" instead of reading the error
 -LOG_FILE = Path("logFile.md")
++REASONING_EFFORT = None  # None = backend default; else "high"|"medium"|"low"|"max"|"none" (Ollama /v1)
 +# FORK: one log per session in logs/ next to jcode.py (or in --project) -
 +# outside the sandbox, so the agent cannot overwrite it and git status in
 +# ./code stays clean.
@@ -151,7 +180,7 @@
  _REQ_NR = 0  # running number of LM Studio requests
  
 +# FORK: automatic model fallback when a daily quota is exhausted.
-+FALLBACK = FallbackChain(CONFIG.chain)
++FALLBACK = FallbackChain(CONFIG.chain, same_provider=CONFIG.fallback_same_provider)  # FORK (ma.5)
 +ACTIVE_ENTRY = None        # chain entry currently in use (None = manual/local model)
 +_AUTO_SWITCHED = False     # True once the fallback left the first model
 +
@@ -162,7 +191,7 @@
      if len(body) > 20_000:
          body = body[:20_000] + "\n...[truncated]"
      # The fence must be longer than any backtick sequence in the content
-@@ -118,6 +188,7 @@
+@@ -137,6 +196,7 @@
      fence = "```"
      while fence in body:
          fence += "`"
@@ -170,7 +199,19 @@
      with LOG_FILE.open("a", encoding="utf-8") as f:
          f.write(f"{header}\n{fence}text\n{body}\n{fence}\n\n")
  
-@@ -164,6 +235,17 @@
+@@ -178,43 +238,46 @@
+     "Project-specific conventions per language come from AGENTS.md. If a "
+     "compiler/interpreter is missing (command not found), report that in the "
+     "summary instead of hiding it. If a Python library is missing "
+-    "(ModuleNotFoundError), install it via 'pip install <package>' and run the test again. "
+-    "Helper files from a skill (test harness, checker scripts) are copied with run_command "
+-    "('cp <skill-dir>/file .'), never retyped with write_file. Write the main deliverable "
+-    "of the task BEFORE any test harness or helper file.\n"
++    # FORK (ma.4): upstream said 'install it via pip install'; these projects
++    # install nothing from inside the agent (AGENTS.md, and the cell forbids it).
++    "(ModuleNotFoundError), report it in the summary; never install anything.\n"
+     "3. If the test fails, analyze the output, fix the code and run the test "
+     "again. Repeat until it passes.\n"
      "4. Only then, without a tool call, reply with a short summary, once the "
      "tests are green."
  )
@@ -187,19 +228,92 @@
 +    return MODE_PROMPTS[MODE]
  
  # ----------------------------------------------------------------- Path sandbox
- def _resolve(rel_path: str) -> Path:
-@@ -188,6 +270,8 @@
+ def _inside(p: Path, root: Path) -> bool:
+     return p == root or root in p.parents
+ 
+ def _resolve(path: str, write: bool = False) -> Path:
+-    """Maps a tool path to a real, symlink-free path and enforces the sandbox:
+-    reads are allowed in ./code and in the skills folder, writes only in ./code.
++    """Maps a tool path to a real, symlink-free path inside ./code.
+ 
+-    Relative paths are relative to ./code (a redundant leading 'code/' is
+-    dropped). Absolute paths are taken as they are, with one exception: a path
+-    whose tail is '<parent-of-sandbox>/<sandbox>/...' but whose prefix is wrong
+-    (the model garbled it, e.g. '02__PROJECTS' for '02__PROJECTS__' - seen in
+-    logs) is re-rooted into ./code. resolve() follows symlinks and '..', so a
+-    link pointing outside is judged by its target.
++    Upstream 2026-10-22 (ma.4): relative paths are relative to ./code (a
++    redundant leading 'code/' is dropped); absolute paths are taken as they
++    are, except a path whose tail is '<parent-of-sandbox>/<sandbox>/...' with a
++    garbled prefix, which is re-rooted into ./code. resolve() follows symlinks
++    and '..', so a link pointing outside is judged by its target.
++    FORK: upstream also allows reads in its skills/ folder; this fork installs
++    no skills, so everything outside ./code is refused. 'write' is kept for
++    the upstream call sites (the write guard itself is in write_file).
+     """
+     raw = (path or ".").strip()
+     p = Path(raw).expanduser()                  # '~/x' is absolute, not a folder named '~'
+     parts = list(p.parts)
+-    # Skill files: accept 'skills/<name>/file', '<name>/file' and absolute paths whose
+-    # prefix the model garbled ('/Users/x/wrong/skills/<name>/file' - seen in logs).
+-    if "skills" in parts and not (SANDBOX / "skills").exists():
+-        rest = parts[parts.index("skills") + 1:]
+-        if rest and rest[0] in SKILLS:
+-            p = SKILLS[rest[0]]["dir"].joinpath(*rest[1:])
+-    elif parts and parts[0] in SKILLS and not (SANDBOX / parts[0]).exists():
+-        p = SKILLS[parts[0]]["dir"].joinpath(*parts[1:])
+-    elif not p.is_absolute():
++    if not p.is_absolute():
+         while parts and parts[0] == SANDBOX.name:
+             parts.pop(0)
+         p = SANDBOX.joinpath(*parts)
+@@ -223,19 +286,10 @@
+     p = p.resolve()
+     if _inside(p, SANDBOX):
+         return p
+-    if _inside(p, SKILLS_DIR):
+-        if write:
+-            raise ValueError(f"'{raw}' is in the skills folder, which is read-only. Copy the file "
+-                             f"into the project first (run_command: cp '{p}' .) and change the copy.")
+-        return p
+-    hint = (" For skill files use load_skill('<skill>', '<file>') or the path 'skills/<skill>/<file>'."
+-            if "skills" in parts else "")
+-    # An absolute path that is wrong in the prefix: show the real one, so the model sees
+-    # the difference instead of trying another file name in the same wrong directory.
+     where = (f" The project directory is '{SANDBOX}' - your path does not start with it "
+              f"(typo in the directory part?)." if Path(raw).expanduser().is_absolute() else "")
+     raise ValueError(f"'{raw}' is outside the project.{where} Use a path RELATIVE to the "
+-                     f"project directory, e.g. 'app.html' or 'src/main.py'.{hint}")
++                     f"project directory, e.g. 'app.html' or 'src/main.py'.")
+ 
+ def _garbled_sandbox_tail(parts: list[str]) -> list[str] | None:
+     """For an absolute path like '/Users/x/02__PROJECTS/83_J_Code/code/app.html' whose
+@@ -249,6 +303,7 @@
+ # ----------------------------------------------------------------------- Tools
+ # Generated/vendored folders: never listed or searched recursively (thousands of
+ # files after 'npm install'), unless the model names them explicitly.
++# (upstream 2026-10-22, ma.4)
+ SKIP_DIRS = {"node_modules", ".git", "__pycache__", ".venv", "venv", ".ruff_cache",
+              ".pytest_cache", ".mypy_cache", "dist", "build", ".DS_Store"}
+ MAX_LIST = 300
+@@ -269,11 +324,11 @@
+     base = _resolve(subdir)
+     if not base.exists():
          return f"'{subdir}' does not exist."
+-    in_project = _inside(base, SANDBOX)
      items = []
-     for p in sorted(base.rglob("*")):
+     for p, skipped in _walk(base):
+-        # project files relative to ./code; skill files absolute, so they can be read directly
+-        shown = str(p.relative_to(SANDBOX)) if in_project else str(p)
 +        if not _inside_sandbox(p):  # FORK (security): no peeking through symlinks
 +            continue
-         tag = "[dir] " if p.is_dir() else "      "
-         items.append(tag + str(p.relative_to(SANDBOX)))
-     return "\n".join(items) or "(empty)"
-@@ -203,14 +287,26 @@
-         )
-     return text
++        shown = str(p.relative_to(SANDBOX))
+         if skipped is not None:
+             items.append(f"[dir] {shown}  ({skipped} entries, not listed)")
+         else:
+@@ -303,12 +358,20 @@
+         out += f"\n[lines {lo}-{hi} of {len(lines)}]"
+     return out
  
 +def _inside_sandbox(path: Path) -> bool:
 +    """FORK (security): True if the path, after following symlinks, is in the sandbox."""
@@ -212,19 +326,22 @@
          rx = re.compile(pattern)
      except re.error as e:
          return f"ERROR: invalid regex: {e}"
-+    # FORK (security): the original followed '..' in the glob and symlinks
-+    # out of code/ - one call could send ~/.bashrc (with the API key) to the
-+    # model. Only files that really lie inside the sandbox are read now.
-+    if ".." in Path(glob).parts:
-+        return "ERROR: '..' is not allowed in glob - it would leave the sandbox."
-     hits = []
-     for p in sorted(SANDBOX.glob(glob.lstrip("/") or "**/*")):
-+        if not _inside_sandbox(p):
-+            continue
++    # FORK (security, ma.3; upstream has the same fix since 2026-10-22): no '..'
++    # and no absolute glob, and only files that really lie inside the sandbox -
++    # the original sent e.g. ~/.bashrc (with the API key) to the model.
+     glob = (glob or "**/*").strip()
+     if Path(glob).is_absolute() or ".." in Path(glob).parts:
+         return "ERROR: glob must be relative to the project and must not contain '..' (e.g. '**/*.py')."
+@@ -316,7 +379,7 @@
+     named = set(Path(glob).parts) & SKIP_DIRS  # 'node_modules/**/*.js' searches it on purpose
+     for p in sorted(SANDBOX.glob(glob)):
          try:
-             text = p.read_text(encoding="utf-8") if p.is_file() else ""
-         except (UnicodeDecodeError, OSError):
-@@ -227,6 +323,7 @@
+-            if not p.is_file() or not _inside(p.resolve(), SANDBOX):
++            if not p.is_file() or not _inside_sandbox(p):
+                 continue  # directories, and symlinks pointing outside the project
+             if (set(p.relative_to(SANDBOX).parts[:-1]) & SKIP_DIRS) - named:
+                 continue  # inside node_modules, .git, ... unless the glob names it
+@@ -335,6 +398,7 @@
  RED = "\033[31m" if USE_COLOR else ""
  GREEN = "\033[32m" if USE_COLOR else ""
  CYAN = "\033[36m" if USE_COLOR else ""
@@ -232,10 +349,10 @@
  DIM = "\033[2m" if USE_COLOR else ""
  RESET = "\033[0m" if USE_COLOR else ""
  
-@@ -265,6 +362,13 @@
+@@ -373,12 +437,19 @@
  
  def write_file(path: str, content: str) -> str:
-     p = _resolve(path)
+     p = _resolve(path, write=True)
 +    # FORK: write guard - executor only under reports/, verifier only under
 +    # the write_paths of settings.json, builder anywhere (as the original).
 +    allowed = CONFIG.write_dirs(MODE)
@@ -245,32 +362,78 @@
 +                f"{folders} - '{path}' was refused, nothing written.")
      p.parent.mkdir(parents=True, exist_ok=True)
      old = p.read_text(encoding="utf-8") if p.is_file() else None
+     if old == content:
+-        # A no-op write is a symptom of a model going in circles - make it visible
+-        # to the model (and to the failure-streak guard) instead of reporting success.
+-        print(f"│    {DIM}(no content change){RESET}")
++        # upstream 2026-10-22 (ma.4): a no-op write is a symptom of a model going in
++        # circles - make it visible to the model (and to the failure-streak guard).
++        print(f"\u2502    {DIM}(no content change){RESET}")
+         return (f"WARNING: '{path}' already had exactly this content - nothing changed. "
+                 "Do NOT write it again; it is done. Continue with the next step of the task.")
      p.write_text(content, encoding="utf-8")
-@@ -373,14 +477,20 @@
+@@ -414,7 +485,7 @@
+     if not p.is_file():
+         return f"File '{path}' not found."
+     text = p.read_text(encoding="utf-8")
+-    if old_string == new_string:
++    if old_string == new_string:  # upstream 2026-10-22 (ma.4)
+         return "ERROR: old_string and new_string are identical - nothing to change. Re-read the file; the text may already be as you want it."
+     count = text.count(old_string)
+     if count == 0:
+@@ -476,39 +547,39 @@
+     | \b(curl|wget)\b[^|]*\|\s*(sudo\s+)?(ba)?sh\b # download piped into shell
+ """)
+ 
+-# Write attempts on skill files (sed -i, open(..., 'w'), mv/rm/tee/..., redirect into the dir).
+-_SKILL_WRITE = re.compile(r"""(?x) \bsed\s+-i | open\([^)]*['"][wa] | \b(mv|rm|tee|truncate|chmod)\b
+-                               | write_text | writelines | \.write\( | >\s*['"]?/\S*/skills/""")
+-
+ # Shell for run_command: bash wherever it exists. /bin/sh is dash on Debian/Ubuntu,
+ # which lacks pipefail, [[ ]], source, {a,b}, echo -e and parses 'cmd &> f' as
+ # 'cmd &' + '> f' - all things models write. Windows: cmd.exe (None = default).
++# (upstream 2026-10-22, ma.4; the cell binds / read-only, so the same path works inside)
+ _SHELL = shutil.which("bash") if os.name != "nt" else None
+ 
+ def run_command(command: str, timeout: int = CMD_TIMEOUT) -> str:
+     """Runs a safe shell command with working directory = sandbox.
+ 
+-    Any harmless command is allowed, including installing libraries
+-    afterwards (e.g. 'pip install requests', 'npm install lodash').
+     Destructive commands (rm -rf /, sudo, dd, mkfs, shutdown, ...) are
+     blocked. Leading 'pip'/'pip3' calls are redirected to the running
+-    Python interpreter so the library lands in jcode's environment.
++    Python interpreter. Upstream 2026-10-22 (ma.4): bash with pipefail for
++    pipes, own process group, and on a timeout the whole process tree is
++    killed and the output until then is returned.
+     """
+     if (m := _DANGEROUS.search(command)) is not None:
          return ("ERROR: command blocked - dangerous pattern "
                  f"{m.group(0).strip()!r}. Only safe commands are allowed.")
-     command = re.sub(r"^\s*pip3?\b", f"{sys.executable} -m pip", command)
+-    if str(SKILLS_DIR) in command and _SKILL_WRITE.search(command):
+-        return ("ERROR: the skills directory is read-only reference material. "
+-                "Copy the file into the project (cp <skill-dir>/file .) and change the copy.")
+     shown = command  # what the model wrote - used in messages
+     # quoted: an interpreter path with spaces ('.../My Projects/.venv/bin/python') must stay one word
+     command = re.sub(r"^\s*pip3?\b", lambda _: f"{shlex.quote(sys.executable)} -m pip", command)
+     if _SHELL and "|" in command:
+         # 'node test.js | head' must report test.js's exit code, not head's
+         command = "set -o pipefail; " + command
 +    timeout = max(1, min(int(timeout), MAX_CMD_TIMEOUT))  # FORK: cap from settings.json
 +    try:
 +        args, shell, env = _command_process(command)  # FORK (E7): cell if enabled
 +    except CellError as e:
 +        return f"ERROR: cell: {e} - nothing was run."
-     try:
-         proc = subprocess.run(
--            command,
--            shell=True,
-+            args,
-+            shell=shell,
-             cwd=SANDBOX,
-             capture_output=True,
-             text=True,
-             timeout=timeout,
-+            env=env,  # FORK (E4): no API keys in the shell
-         )
-     except subprocess.TimeoutExpired:
-         return f"TIMEOUT after {timeout}s: {command!r}"
-@@ -390,6 +500,54 @@
-         out = out[:2000] + "\n...[truncated]...\n" + out[-2000:]
+     proc = subprocess.Popen(
+-        command, shell=True, executable=_SHELL, cwd=SANDBOX, text=True,
++        args, shell=shell, executable=_SHELL if shell else None, cwd=SANDBOX, text=True,
+         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
++        env=env,  # FORK (E4): no API keys in the shell
+         start_new_session=True,  # own process group: a timeout kills the whole tree (node, chrome, ...)
+     )
+     timed_out = False
+@@ -530,6 +601,56 @@
+                 f"Output until then:\n{out}")
      return f"exit_code={proc.returncode}\n{out}"
  
 +def _command_env() -> dict:
@@ -282,14 +445,14 @@
 +def _command_process(command: str) -> tuple:
 +    """FORK (E7): (args, shell, env) for subprocess.run. Without a cell as
 +    before: /bin/sh -c in code/ with the E4 environment. With a cell:
-+    bwrap ... -- /bin/sh -c <command>; inside, only the cell's short variable
++    bwrap ... -- bash -c <command> (ma.4: was /bin/sh); inside, only the cell's short variable
 +    list (taken from the E4 environment); bwrap itself starts with LAUNCH_ENV
 +    (it is process 1 in the cell and its environment is readable there).
 +    The cell has its own PID namespace, so a timeout also ends every
 +    process the command left running in the background."""
 +    if not CELL.enabled:
 +        return command, True, _command_env()
-+    argv, _notes = build_argv(CELL, command=["/bin/sh", "-c", command], workdir=SANDBOX,
++    argv, _notes = build_argv(CELL, command=[_SHELL or "/bin/sh", "-c", command], workdir=SANDBOX,
 +                              environ=_command_env(), passthrough=CONFIG.env_passthrough,
 +                              bwrap=_BWRAP)
 +    return argv, False, dict(LAUNCH_ENV)
@@ -318,22 +481,152 @@
 +    """FORK (E7): one line for the start screen."""
 +    if not CELL.enabled:
 +        return "off (run_command sees the whole home folder)"
-+    return (f"ON (bubblewrap): only code/ writable, {len(CELL.read_only)} read-only "
-+            f"path(s), empty home folder")
++    inside = ("code/ writable except " + ", ".join(f"{p}/" for p in CELL.read_only_in_workdir)
++              if CELL.read_only_in_workdir else "only code/ writable")  # FORK (ma.5)
++    return (f"ON (bubblewrap): {inside}, {len(CELL.read_only)} read-only "
++            f"path(s), empty home folder{'' if CELL.network else ', no network'}")
 +
  def web_search(query: str, max_results: int = 5) -> str:
      """Web search via DuckDuckGo; returns title, URL and snippet of the hits."""
      try:
-@@ -705,8 +863,17 @@
-             "(e.g. 'pip install requests', 'npm install lodash'). "
+@@ -706,7 +827,7 @@
+         from PIL import ImageGrab
+         img = ImageGrab.grab()
+     except Exception as e:  # noqa: BLE001 - e.g. Wayland: use a system screenshot tool
+-        import tempfile
++        import shutil, tempfile
+         tool = next((c for c in (["grim"], ["gnome-screenshot", "-f"], ["spectacle", "-bno"])
+                      if shutil.which(c[0])), None)
+         if tool is None:
+@@ -718,7 +839,7 @@
+         img = Image.open(tmp); img.load()
+     label = "Screenshot"
+     if save_as:
+-        p = _resolve(save_as if Path(save_as).suffix else save_as + ".png", write=True)
++        p = _resolve(save_as if Path(save_as).suffix else save_as + ".png")
+         p.parent.mkdir(parents=True, exist_ok=True)
+         img.save(p); label += f" (saved as '{p.relative_to(SANDBOX)}')"
+     return _attach_image(img, label)
+@@ -764,11 +885,13 @@
+                     part.clear(); part.update({"type": "text", "text": "[older image removed from context]"})
+ 
+ def _has_images(messages: list) -> bool:
++    """upstream 2026-10-22 (ma.4)."""
+     return any(isinstance(m.get("content"), list) and any(p.get("type") == "image_url" for p in m["content"])
+                for m in messages)
+ 
+ def _strip_images(messages: list) -> int:
+-    """Replaces every image part by a text stub (model/server without vision). Returns the count."""
++    """Replaces every image part by a text stub (model/server without vision). Returns the count.
++    upstream 2026-10-22 (ma.4)."""
+     n = 0
+     for m in messages:
+         if isinstance(m.get("content"), list):
+@@ -783,60 +906,7 @@
+         return " ".join("[image]" if p.get("type") == "image_url" else p.get("text", "") for p in content)
+     return str(content or "")
+ 
+-# ---------------------------------------------------------------------- Skills
+-# Claude-Code-compatible layout: skills/<name>/SKILL.md with YAML frontmatter
+-# (name, description). The catalog goes into the system prompt; the model
+-# loads a skill on demand via load_skill(). Relative links in the Markdown
+-# (./forms.md, [x](forms.md)) point to files in the same skill folder.
+-SKILLS_DIR = (Path(__file__).resolve().parent / "skills").resolve()  # resolved: may be a symlink
+-
+-def _parse_frontmatter(text: str) -> tuple[dict, str]:
+-    """Splits '---' YAML frontmatter from the Markdown body. Minimal YAML:
+-    'key: value' lines; indented continuation lines (e.g. after 'key: >') are appended."""
+-    m = re.match(r"\A---\r?\n(.*?)\r?\n---\r?\n?(.*)\Z", text, re.S)
+-    if not m:
+-        return {}, text
+-    meta, key = {}, None
+-    for line in m.group(1).splitlines():
+-        if line[:1].isspace() and key:
+-            meta[key] = (meta[key] + " " + line.strip()).strip()
+-        elif ":" in line and not line.startswith("#"):
+-            key, _, val = line.partition(":")
+-            key = key.strip(); meta[key] = val.strip().strip("\"'").lstrip(">|").strip()
+-    return meta, m.group(2)
+-
+-def _load_skills() -> dict[str, dict]:
+-    """name -> {'description', 'dir'} for every skills/<name>/SKILL.md."""
+-    skills = {}
+-    for f in sorted(SKILLS_DIR.glob("*/SKILL.md")):
+-        try:
+-            meta, _ = _parse_frontmatter(f.read_text(encoding="utf-8"))
+-        except OSError:
+-            continue
+-        skills[meta.get("name") or f.parent.name] = {"description": meta.get("description", ""), "dir": f.parent}
+-    return skills
+-SKILLS = _load_skills()
+-
+-def load_skill(name: str, file: str = "SKILL.md") -> str:
+-    """Returns the instructions of a skill (SKILL.md) or one of its linked files."""
+-    if name not in SKILLS:
+-        return f"Unknown skill '{name}'. Available: {', '.join(SKILLS) or '(none)'}"
+-    d = SKILLS[name]["dir"]
+-    p = (d / (file or "SKILL.md")).resolve()
+-    if d not in p.parents or not p.is_file():
+-        return f"File '{file}' not found in skill '{name}'."
+-    body = p.read_text(encoding="utf-8")
+-    if p.name == "SKILL.md":
+-        _, body = _parse_frontmatter(body)
+-        others = [str(q.relative_to(d)) for q in sorted(d.rglob("*")) if q.is_file() and q != p]
+-        if others:
+-            body += "\n\nFiles of this skill:\n" + "\n".join(
+-                f"- {o}  -> read: load_skill({name!r}, {o!r})" +
+-                (f"  |  run: {d / o}" if o.endswith((".py", ".js", ".sh")) else "") for o in others)
+-    return f"Skill '{name}' (directory: {d})\n\n{body.strip()}"
+-
+ TOOL_FUNCS = {
+-    "load_skill": load_skill,
+     "list_files": list_files,
+     "read_file": read_file,
+     "search_files": search_files,
+@@ -856,15 +926,6 @@
+ # parameter types and the required[] list directly from each function's type
+ # annotations, so adding/renaming a parameter never causes schema/code drift.
+ _TOOL_META = {
+-    "load_skill": {
+-        "description": (
+-            "Loads the instructions of a skill listed in the system prompt. Call it "
+-            "BEFORE starting a task that matches the skill's description and follow "
+-            "the returned instructions. Relative links in the text (e.g. './forms.md' "
+-            "or '[x](forms.md)') are files of the same skill - read them with file='forms.md'."
+-        ),
+-        "params": {"name": "Skill name from the list", "file": "Linked file, default 'SKILL.md'"},
+-    },
+     "list_files": {
+         "description": "Recursively lists files/folders in the sandbox.",
+         "params": {"subdir": "Subfolder, default '.'"},
+@@ -875,8 +936,7 @@
+             "numbers are prefixed (format '   N\u2502line') \u2014 use this ONLY before "
+             "insert_lines/delete_lines. For edit_file always use numbered=false "
+             "and copy old_string verbatim from the result; never include line "
+-            "numbers in old_string. Skill files are readable (read-only) via the "
+-            "absolute path that load_skill shows."
++            "numbers in old_string."
+         ),
+         "params": {"numbered": "Show line numbers, default false",
+                    "start_line": "First line to return (1-based); use with end_line to read only the region around a search_files hit instead of the whole file",
+@@ -920,14 +980,23 @@
+         "description": (
+             "Runs a safe shell command in the 'code' directory and returns "
+             "exit_code, stdout and stderr. For smoke tests/tests (e.g. "
+-            "'python -m pytest -q') AND for installing missing libraries "
+-            "(e.g. 'pip install requests', 'npm install lodash'). "
++            "'python -m pytest -q'). "
++            # FORK (ma.4): upstream also offered it for installing libraries.
              "Destructive commands (rm -rf /, sudo, dd, mkfs, shutdown, ...) "
-             "are blocked."
+             "are blocked. Background processes (servers, GUIs) MUST redirect "
+             "their output and be detached ('cmd > x.log 2>&1 &'), otherwise "
+             "the call blocks until the timeout."
 +            # FORK (E7): tell the model what the cell means for it.
 +            + (" The command runs in an isolated cell: only the 'code' directory "
 +               "is writable, the home folder is empty and nothing can be installed "
 +               "outside 'code'." if CELL.enabled else "")
          ),
--        "params": {"timeout": "Seconds, default 30"},
+-        "params": {"timeout": f"Seconds, default {CMD_TIMEOUT}"},
 +        # FORK: the original said 'default 30' while the real default is
 +        # CMD_TIMEOUT; long project scripts need an explicit long timeout.
 +        "params": {"timeout": (f"Seconds, default {CMD_TIMEOUT}, maximum "
@@ -343,7 +636,7 @@
      },
      "web_search": {
          "description": (
-@@ -783,6 +950,19 @@
+@@ -1004,6 +1073,19 @@
  
  TOOLS = [_build_tool_schema(fn) for fn in TOOL_FUNCS.values()]
  
@@ -363,7 +656,7 @@
  # ----------------------------------------------------------------- Display/UI
  def clear_screen() -> None:
      """Clears the terminal screen (cross-platform)."""
-@@ -805,18 +985,37 @@
+@@ -1026,11 +1108,20 @@
  """
      print(banner)
      print(f"    {APP_NAME} v{APP_VERSION} - local coding agent")
@@ -385,11 +678,11 @@
      print("    " + "\u2500" * 50)
      print("    Describe a task: Enter submits, Ctrl+J starts a new line, Ctrl+C aborts")
      print("    the input or a running task, Ctrl+D or Ctrl+C on an empty prompt exits.")
-     print("    History is kept across tasks. '/status' shows usage, '/new' clears the session,")
+@@ -1038,7 +1129,16 @@
      print("    '/model' sets model, '/models' lists models, '/backend <name>' switches to")
      print("    lm-studio, ollama or a settings.json provider, '/max-turns N' sets step limit,")
--    print("    '/reasoning high|medium|low|max|none' sets thinking effort (none = off).\n")
-+    print("    '/reasoning high|medium|low|max|none' sets thinking effort (none = off),")
+     print("    '/reasoning high|medium|low|max|none' sets thinking effort (none = off),")
+-    print("    '/skills' lists skills, '/<skill> task' runs a task with that skill preloaded.\n")
 +    print(f"    '/mode {'|'.join(CONFIG.modes)}' switches mode and starts a new session.\n")
 +
 +def _hidden_secrets_note() -> str:
@@ -403,10 +696,33 @@
  
  # Descriptive action label per tool call - WITHOUT code/file content.
  def _action_label(name: str, args: dict) -> str:
-@@ -882,25 +1081,88 @@
- class LLMUnavailable(Exception):
+@@ -1077,8 +1177,6 @@
+         return f"\U0001f4f8 Screenshot {args.get('save_as') or ''}".rstrip()
+     if name == "view_pdf_page":
+         return f"\U0001f4c4 Rendering  {target} (page {args.get('page', 1)})"
+-    if name == "load_skill":
+-        return f"\U0001f4da Skill      {args.get('name', '')}/{args.get('file') or 'SKILL.md'}"
+     return f"\u2699\ufe0f  {name}"
+ 
+ # Compact result status - never output file content or code.
+@@ -1105,7 +1203,8 @@
+ def _error_key(name: str, result: str) -> tuple[str, str] | None:
+     """(tool, error class) for a failed tool result, None for a successful one.
+     Quoted strings and numbers are masked, so "'probe1.js' is outside the project"
+-    and "'probe2.js' is outside the project" count as the same error."""
++    and "'probe2.js' is outside the project" count as the same error.
++    upstream 2026-10-22 (ma.4)."""
+     first = result.splitlines()[0] if result else ""
+     if first.startswith("WARNING: identical call") or first.startswith("WARNING: this is failure"):
+         first = next((l for l in result.splitlines()[1:] if l.strip()), "")  # our own guard prefixes
+@@ -1120,7 +1219,51 @@
      """All retry attempts against LM Studio have failed."""
  
+ class LLMRejected(Exception):
+-    """The server rejected the request itself (4xx): retrying can't help."""
++    """The server rejected the request itself (4xx): retrying can't help.
++    upstream 2026-10-22 (ma.4)."""
++
 +def _effective_reasoning() -> str | None:
 +    """FORK: /reasoning wins; otherwise the active chain entry's setting."""
 +    if REASONING_EFFORT:
@@ -449,13 +765,13 @@
 +    print(f"{DIM}Quota of {first.model} is available again - switching back.{RESET}")
 +    if _activate_entry(first):
 +        _AUTO_SWITCHED = first != FALLBACK.entries[0]
-+
+ 
  def _chat(**kwargs):
      """Calls the chat completion with retry attempts.
- 
-     On errors (server unreachable, timeout, model still loading, 5xx) it
-     retries with growing wait times. If all attempts fail, LLMUnavailable is
+@@ -1130,37 +1273,53 @@
      raised - the caller decides how to handle it (the session is preserved).
+     A 4xx answer (bad request: context too long, images not supported, invalid
+     tool schema, ...) is raised at once as LLMRejected.
 +
 +    FORK: model and reasoning effort are set here on every attempt, so a
 +    model switch takes effect immediately. An HTTP 429 for a daily quota
@@ -477,6 +793,12 @@
          except KeyboardInterrupt:
              raise  # never swallow Ctrl+C
          except Exception as e:  # noqa: BLE001
++            # upstream 2026-10-22 (ma.4): a 4xx other than 408/409/429 is not retried.
++            # FORK: 429 keeps going to the model fallback below.
+             status = getattr(e, "status_code", None)
+             if status and 400 <= status < 500 and status not in (408, 409, 429):
+                 _log("### Request rejected", str(e))
+                 raise LLMRejected(str(e)) from e
              last_err = e
 +            limit = classify_rate_limit(e)
 +            if limit == "daily" or (limit and attempt == attempts):
@@ -491,19 +813,29 @@
              if attempt == attempts:
                  break
 -            wait = RETRY_WAITS[attempt - 1]
+-            # First failure: full error text (e.g. a Jinja template error from
+-            # the backend), so the cause is visible immediately. Later retries
+-            # only repeat a short version to avoid flooding the terminal.
+-            reason = str(e)
+-            if attempt == 1:
+-                _log("### Request error", reason)
+-            else:
+-                reason = reason.replace("\n", " ")[:120]
 +            wait = (retry_delay_seconds(e) if limit else None) or RETRY_WAITS[attempt - 1]
-             reason = str(e).replace("\n", " ")[:120]
++            reason = str(e).replace("\n", " ")[:120]
              print(
                  f"{DIM}\u26a0\ufe0f  {BACKEND} request failed "
-@@ -908,6 +1170,7 @@
-                 f"   Retrying in {wait}s...{RESET}"
+-                f"(attempt {attempt}/{attempts}):{RESET}\n{reason}\n"
+-                f"{DIM}   Retrying in {wait}s...{RESET}"
++                f"(attempt {attempt}/{attempts}): {reason}\n"
++                f"   Retrying in {wait}s...{RESET}"
              )
              time.sleep(wait)
 +            attempt += 1
      raise LLMUnavailable(f"{BACKEND} unreachable after {attempts} attempts: {last_err}")
  
  # ------------------------------------------------------- Context compaction
-@@ -925,6 +1188,20 @@
+@@ -1178,6 +1337,20 @@
              chars += len(json.dumps(tc, ensure_ascii=False))
      return chars // 4 + images * IMAGE_TOKENS
  
@@ -524,7 +856,7 @@
  def _compact_cut_index(messages: list) -> int:
      """Determines the index from which messages are kept.
  
-@@ -932,7 +1209,8 @@
+@@ -1185,7 +1358,8 @@
      assistant message with tool_calls - the cut must not tear such a pair
      apart.
      """
@@ -534,7 +866,7 @@
      while cut < len(messages) and messages[cut].get("role") == "tool":
          cut += 1
      return cut
-@@ -942,9 +1220,14 @@
+@@ -1195,9 +1369,14 @@
  
      Kept are: the system prompt, a summary of the middle part and the most
      recent messages (without torn tool pairs).
@@ -550,7 +882,7 @@
      if not old:
          return messages  # nothing to compress
  
-@@ -962,13 +1245,16 @@
+@@ -1215,13 +1394,16 @@
              content = (content + f" [tool calls: {calls}]").strip()
          parts.append(f"{role}: {content}")
      transcript = "\n".join(parts)
@@ -570,7 +902,7 @@
              temperature=0.1,
              messages=[
                  {
-@@ -992,10 +1278,9 @@
+@@ -1245,10 +1427,9 @@
          for msg in old:
              if msg.get("role") == "tool" and len(str(msg.get("content") or "")) > 200:
                  msg["content"] = str(msg["content"])[:200] + "...[truncated]"
@@ -583,17 +915,37 @@
          {
              "role": "user",
              "content": (
-@@ -1031,22 +1316,32 @@
+@@ -1284,9 +1465,10 @@
      print(f"\n\U0001f4ca Session status")
      print(f"   Context   : [{bar}] {pct:5.1f} %")
      print(f"   Tokens    : ~{_fmt(used)} / {_fmt(CONTEXT_LIMIT)} ({source}), "
--          f"compaction from {_fmt(COMPACT_THRESHOLD)}")
+-          f"compaction {'from ' + _fmt(COMPACT_THRESHOLD) if AUTO_COMPACT else 'off'}")
 +          f"compaction from {_fmt(_compact_threshold())}")
      print(f"   Messages  : {len(messages)} total - {n_user} tasks/inputs, "
            f"{n_tool} tool results")
 +    print(f"   Mode      : {MODE} (max steps {MAX_STEPS})")  # FORK
      print(f"   Model     : {MODEL}")
      print(f"   Sandbox   : {SANDBOX}")
+ 
+@@ -1295,7 +1477,7 @@
+ 
+     Uses usage.completion_tokens from the server if present; otherwise
+     approximates with ~4 characters per token over content + tool-call
+-    arguments (then marked with '~').
++    arguments (then marked with '~'). upstream 2026-10-22 (ma.4).
+     """
+     tokens = getattr(usage, "completion_tokens", None) if usage else None
+     exact = bool(tokens)
+@@ -1306,7 +1488,7 @@
+         tokens = max(1, chars // 4)
+     tps = tokens / elapsed if elapsed > 0 else 0.0
+     approx = "" if exact else "~"
+-    line = (f"⏱ {elapsed:.1f}s | {approx}{tokens:,} tokens | "
++    line = (f"\u23f1 {elapsed:.1f}s | {approx}{tokens:,} tokens | "
+             f"{approx}{tps:.1f} tok/s")
+     if (ctx := getattr(usage, "prompt_tokens", None) if usage else None):
+         line += f" | context {ctx:,}"  # what the server actually received - compare with its context length
+@@ -1315,75 +1497,99 @@
  
  def new_session() -> list:
      """Starts a fresh session history (system prompt only)."""
@@ -614,25 +966,74 @@
          encoding="utf-8",
      )
 -    _log("### System prompt", SYSTEM_PROMPT)
--    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+-    system = SYSTEM_PROMPT
 +    prompt_text = _mode_prompt()  # FORK: system prompt depends on the mode
 +    _log("### System prompt", prompt_text)
 +    messages = [{"role": "system", "content": prompt_text}]
  
+-    # AGENTS.md is merged into the ONE system message: many chat templates
+-    # (e.g. Qwen3) raise "System message must be at the beginning" if a
+-    # second system message follows the first one.
      agents = _load_agents_md()
      if agents:
-@@ -1066,7 +1361,49 @@
+         _log("### AGENTS.md guidelines", agents)
+-        system += (
+-            "\n\nThe following are project-specific guidelines from the "
+-            "AGENTS.md file in the working directory. Treat them as "
+-            "binding instructions that take precedence over your general "
+-            "defaults, unless they conflict with safety constraints:\n\n"
+-            f"{agents}"
+-        )
++        messages.append({
++            "role": "system",
++            "content": (
++                "The following are project-specific guidelines from the "
++                "AGENTS.md file in the working directory. Treat them as "
++                "binding instructions that take precedence over your general "
++                "defaults, unless they conflict with safety constraints:\n\n"
++                f"{agents}"
++            ),
++        })
+         print(f"   {GREEN}\u2713 AGENTS.md loaded "
+               f"({len(agents)} chars){RESET}")
  
-     return messages
+-    if SKILLS and INLINE_SKILLS:
+-        # Full SKILL.md texts in the system prompt - for models that ignore the catalog.
+-        bodies = "\n\n".join(load_skill(n) for n in SKILLS)
+-        _log("### Skills (inline)", bodies)
+-        system += ("\n\nSkills - follow the one(s) matching the task; read their linked "
+-                   "files with load_skill(name, file). Skill files are read-only reference "
+-                   "material: to change one, copy it into the project first.\n\n" + bodies)
+-        print(f"   {GREEN}\u2713 {len(SKILLS)} skill(s) inlined ({len(bodies)} chars): {', '.join(SKILLS)}{RESET}")
+-    elif SKILLS:
+-        catalog = "\n".join(f"- {n}: {s['description']}" for n, s in SKILLS.items())
+-        _log("### Skills", catalog)
+-        system += ("\n\nAvailable skills. The instructions of the skills matching a task are "
+-                   "inserted into the task message automatically - follow them; don't load "
+-                   "those again. Call load_skill(name) only for a skill that is not in the task "
+-                   "but turns out to be needed, and load_skill(name, file) for linked files. "
+-                   "Skill files are read-only reference material: to change one, copy it into "
+-                   "the project first.\n" + catalog)
+-        print(f"   {GREEN}\u2713 {len(SKILLS)} skill(s): {', '.join(SKILLS)}{RESET}")
+-
+-    return [{"role": "system", "content": system}]
++    return messages
  
+-def _pick_skills(task: str) -> list[str]:
+-    """One tool-less request: which skills apply to this task? Returns their names.
 +def _report_sandbox_changes() -> None:
 +    """FORK: after every task, show what changed in ./code according to git.
-+
+ 
+-    Small models ignore the 'call load_skill first' instruction in the system
+-    prompt; selecting explicitly and injecting the instructions is reliable.
 +    In executor mode any change outside reports/ is unexpected: run_command
 +    can still modify files from the shell, so this is the safety net. It
 +    only reports; restoring ('git restore .', 'git clean') stays a human
 +    decision.
-+    """
+     """
+-    if not SKILLS:
+-        return []
+-    catalog = "\n".join(f"- {n}: {s['description']}" for n, s in SKILLS.items())
 +    # FORK: verifier mode may change its write_paths; builder is checked
 +    # against reports/ as before.
 +    allowed = CONFIG.write_dirs(MODE) or (REPORTS_DIR_NAME,)
@@ -657,46 +1058,126 @@
 +        print(f"{color}   Verifier mode may only change {folders}. Review them; to undo: "
 +              f"'git restore -- <file>' (and 'git clean -n' for new files) in {SANDBOX}{RESET}")
 +
- def run(task: str, messages: list) -> list:
++def run(task: str, messages: list) -> list:
 +    """FORK: wraps the original task loop (_run_steps) - switches back to the
 +    first model if its quota is available again, and checks git afterwards,
 +    also when the task is aborted with Ctrl+C."""
 +    _restore_primary_if_possible()
-+    try:
++    reports_dir = SANDBOX / REPORTS_DIR_NAME
++    before = report_names(reports_dir)
+     try:
+-        resp = _chat(model=MODEL, temperature=0, messages=[
+-            {"role": "system", "content": "You select skills for a coding agent. Reply ONLY with the "
+-             "comma-separated names of the skills whose description matches the task, or 'none'."},
+-            {"role": "user", "content": f"Skills:\n{catalog}\n\nTask:\n{task[:3000]}"}])
+-        text = resp.choices[0].message.content or ""
+-    except Exception as e:  # noqa: BLE001
+-        _log("### Skill selection failed", str(e)); return []
+-    text = re.sub(r"<think>.*?</think>", "", text, flags=re.S)  # reasoning models
+-    picked = [n for n in SKILLS if re.search(rf"(?<![\w-]){re.escape(n)}(?![\w-])", text)]
+-    _log("### Skill selection", f"model answer: {text.strip()[:300]}\npicked: {picked}")
+-    return picked
 +        return _run_steps(task, messages)
 +    finally:
++        _name_reports_after_model(reports_dir, before)
 +        _report_sandbox_changes()
 +
++def _name_reports_after_model(reports_dir: Path, before: set) -> None:
++    """FORK (ma.5): with report_model_suffix, the reports this task wrote get
++    the model in their name (reports/<task>__<model>.md): the model in use
++    when the task ended, which is the only one if fallback_same_provider and
++    a single-model chain keep it from changing."""
++    if not CONFIG.report_model_suffix:
++        return
++    for old, new in add_model_suffix(reports_dir, before, MODEL):
++        print(f"{DIM}   report renamed: reports/{old} -> reports/{new}{RESET}")
++        _log("### Report renamed", f"{old} -> {new} (model {BACKEND}/{MODEL})")
+ 
+-def run(task: str, messages: list, auto_skills: bool = True) -> list:
 +def _run_steps(task: str, messages: list) -> list:
      """Runs a task on the (session-wide) history.
  
      The history is preserved across tasks; the compaction therefore works
-@@ -1082,7 +1419,7 @@
+@@ -1391,27 +1597,22 @@
+     is done in place, so the caller's list stays the live history).
+     """
+     global _REQ_NR, LAST_USAGE_TOKENS
+-    _log("### Task (user)", task)
+-    if auto_skills and (picked := _pick_skills(task)):
+-        print(f"{DIM}\U0001f4da Skills: {', '.join(picked)}{RESET}")
+-        task += ("\n\n[The following skill instructions apply to this task. Follow them; "
+-                 "read their linked files with load_skill(name, file).]\n\n"
+-                 + "\n\n".join(load_skill(n) for n in picked))
+     messages.append({"role": "user", "content": task})
++    _log("### Task (user)", task)
+ 
+     last_total_tokens = 0
+-    # Guard against identical tool calls: compared with the last REPEAT_WINDOW calls, not only
+-    # the previous one, so A-B-A-B cycles (seen in logs: rewriting the same 3 files) count too.
++    # upstream 2026-10-22 (ma.4): guard against identical tool calls, compared with the
++    # last REPEAT_WINDOW calls, so A-B-A-B cycles count too.
+     recent_calls, repeats, nudged = collections.deque(maxlen=REPEAT_WINDOW), 0, False
+     # Second guard: the same tool failing with the same KIND of error, even with different
+-    # arguments (seen in logs: write_file with 20 different file names in a wrong directory).
++    # arguments (e.g. write_file with 20 different file names in a wrong directory).
+     fail_key, fail_streak, fail_nudged = None, 0, False
+     rejected_once = False  # one recovery attempt (strip images / compact) per request
+     for step in range(1, MAX_STEPS + 1):
          # Check the context: prefer the real usage values of the last
          # response, otherwise the character heuristic. Compact on overflow.
          used = max(last_total_tokens, _estimate_tokens(messages))
--        if used > COMPACT_THRESHOLD:
+-        if AUTO_COMPACT and used > COMPACT_THRESHOLD:
 +        if used > _compact_threshold():  # FORK: was COMPACT_THRESHOLD
              messages[:] = _compact_messages(messages)
              last_total_tokens = 0
              LAST_USAGE_TOKENS = 0
-@@ -1093,9 +1430,9 @@
+@@ -1422,10 +1623,10 @@
              _log(f"### Request {_REQ_NR}",
                   f"{len(messages)} messages in context, last: "
                   f"{_content_text(messages[-1].get('content'))[:300]}")
--            resp = _chat(
--                model=MODEL, messages=messages, tools=TOOLS, temperature=0.2,
--                **({"reasoning_effort": REASONING_EFFORT} if REASONING_EFFORT else {}))
 +            # FORK: tools depend on the mode; model and reasoning effort are
 +            # filled in by _chat (they can change during a model fallback).
+             t_start = time.perf_counter()
+-            resp = _chat(
+-                model=MODEL, messages=messages, tools=TOOLS, temperature=TEMPERATURE,
+-                **({"reasoning_effort": REASONING_EFFORT} if REASONING_EFFORT else {}))
 +            resp = _chat(messages=messages, tools=_active_tools(), temperature=0.2)
+             elapsed = time.perf_counter() - t_start
          except LLMUnavailable as e:
              _log("### Error", str(e))
-             print(f"\n{RED}\u2717 {e}{RESET}")
-@@ -1136,7 +1473,13 @@
+@@ -1433,7 +1634,7 @@
+             print("  The session is preserved - check whether the "
+                   f"{BACKEND} server is running, then submit the task again.")
+             return messages
+-        except LLMRejected as e:
++        except LLMRejected as e:  # upstream 2026-10-22 (ma.4)
+             err = str(e).lower()
+             if _has_images(messages) and not rejected_once:
+                 # Model/server without vision: drop the images and carry on text-only.
+@@ -1445,7 +1646,7 @@
+                     "[The model cannot see images. The image(s) above were removed - "
+                     "verify visually in another way, e.g. by asserting on state or pixels in a test.]"})
+                 continue
+-            if "context" in err and AUTO_COMPACT and not rejected_once:
++            if "context" in err and not rejected_once:
+                 rejected_once = True  # context too long: compact now, try once more
+                 messages[:] = _compact_messages(messages); last_total_tokens = LAST_USAGE_TOKENS = 0
+                 continue
+@@ -1474,7 +1675,7 @@
+             _log("### LLM response", plan or "(tool calls only)")
+         if plan:
+             print(f"\n\U0001f9e0 {plan}")
+-        print(_stats_line(usage, msg, elapsed))
++        print(_stats_line(usage, msg, elapsed))  # upstream 2026-10-22 (ma.4)
+ 
+         if not msg.tool_calls:
+             if plan:
+@@ -1489,13 +1690,17 @@
                  args = json.loads(tc.function.arguments or "{}")
                  _log("### Tool use", f"`{name}` {json.dumps(args, ensure_ascii=False)[:1500]}")
                  print("\u2502  " + _action_label(name, args))
+-                if name not in TOOL_FUNCS:
+-                    raise KeyError(f"unknown tool '{name}' - available: {', '.join(TOOL_FUNCS)}")
 -                result = TOOL_FUNCS[name](**args)
 +                # FORK: a model may call a tool it was not offered (e.g. an
 +                # edit tool it remembers); refuse instead of executing it.
@@ -707,8 +1188,24 @@
 +                    result = TOOL_FUNCS[name](**args)
              except Exception as e:  # noqa: BLE001
                  result = f"ERROR: {e}"
-             _log("### Tool response", str(result))
-@@ -1160,20 +1503,99 @@
+-            # Loop guard: same tool, same arguments AND same result as one of the recent calls.
+-            # (Re-running a test after an edit gives a different result and is fine.)
++            # upstream 2026-10-22 (ma.4) - loop guard: same tool, same arguments AND same
++            # result as one of the recent calls (re-running a test after an edit is fine).
+             call = (name, tc.function.arguments, str(result))
+             repeats = repeats + 1 if call in recent_calls else 0
+             recent_calls.append(call)
+@@ -1515,8 +1720,7 @@
+                         "Repeating it cannot produce new information. Before any further tool call, "
+                         "answer in text: (1) what did you expect, (2) what did you actually observe, "
+                         "(3) three different hypotheses for the difference, (4) the ONE cheapest "
+-                        "experiment that distinguishes them. Then run exactly that experiment. "
+-                        "If a skill in the system prompt covers this topic, load it first.")})
++                        "experiment that distinguishes them. Then run exactly that experiment.")})
+                     break
+                 print(f"\u2514\u2500\n{RED}\u2717 Task stopped: the same tool call was repeated again "
+                       f"after a warning - the model is stuck. The session is preserved.{RESET}")
+@@ -1572,20 +1776,103 @@
          if len(messages) - i < len(messages[i - 1]["tool_calls"]):
              del messages[i - 1:]
  
@@ -734,6 +1231,10 @@
 +    if mode is None:
 +        print(f"{RED}\u2717 Use: /mode {'|'.join(CONFIG.modes)} "
 +              f"(or ejecutor|constructor|verificador){RESET}")
++        return None
++    if mode not in CONFIG.modes:  # FORK (ma.5): allowed_modes in settings.json
++        print(f"{RED}\u2717 Mode {mode} is not allowed in this project "
++              f"(allowed_modes: {', '.join(CONFIG.modes)}).{RESET}")
 +        return None
 +    MODE, MAX_STEPS, LAST_USAGE_TOKENS = mode, CONFIG.max_steps[mode], 0
 +    print(f"{YELLOW}Mode: {MODE.upper()} - max steps {MAX_STEPS}, "
@@ -814,7 +1315,7 @@
              except (EOFError, KeyboardInterrupt) as e:
                  if getattr(e, "text", "").strip():   # Ctrl+C with text: discard it only
                      print(f"{DIM}(input discarded){RESET}")
-@@ -1182,24 +1604,10 @@
+@@ -1594,31 +1881,12 @@
                  break
              if not task:
                  continue
@@ -826,6 +1327,11 @@
 -            if task.lower() == "/status":
 -                print_status(session)
 -                continue
+-            if task.lower() == "/skills":
+-                print("\n".join(f"  {n}: {s['description']}" for n, s in SKILLS.items()) or "  (no skills in skills/)"); continue
+-            manual_skill = task.startswith("/") and (sk := task[1:].split(maxsplit=1))[0] in SKILLS
+-            if manual_skill:  # '/<skill> task' - inject the skill instructions directly into the task
+-                task = load_skill(sk[0]) + "\n\nTask: " + (sk[1] if len(sk) > 1 else "Follow the skill instructions.")
 -            if task.lower() == "/models":
 -                print("\n".join(f"  {m}" for m in (_fetch_models(BASE_URL) or ["(no models found)"]))); continue
 -            if task.lower().startswith("/backend"):
@@ -841,5 +1347,8 @@
 +                if handled:
 +                    continue
              try:
-                 session = run(task, session)
+-                session = run(task, session, auto_skills=not manual_skill)
++                session = run(task, session)
              except KeyboardInterrupt:
+                 _discard_incomplete(session)
+                 print(f"\n{RED}\u2717 Task aborted (Ctrl+C) - the session is preserved.{RESET}")

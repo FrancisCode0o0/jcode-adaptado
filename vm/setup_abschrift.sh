@@ -137,7 +137,7 @@ install_gemini_cli() {
     if [ "$installed" = "$GEMINI_CLI_VERSION" ]; then
         echo "Gemini CLI $installed already installed. Skipped."
     elif [ -n "$installed" ]; then
-        die "Gemini CLI $installed found, this jcode pins $GEMINI_CLI_VERSION; nothing changed (ask in the MejoraDeAudio chat)"
+        die "Gemini CLI $installed found, this jcode pins $GEMINI_CLI_VERSION; nothing changed (ask in the chat that works on jcode)"
     elif [ "$SKIP_DOWNLOADS" = "1" ]; then
         echo "Gemini CLI download skipped (SKIP_DOWNLOADS=1)."
         return

@@ -5,7 +5,8 @@ do not notice ("SURVIVED") means a protection is not really tested.
 
 Origin: written by the Abschrift chat for 0.10.0-ma.2 (E1-E4, E6); extended
 in 0.10.0-ma.3 (mejorador-audio plan step 1.0.b1): merged secret check and
-session check, cells, search_files fix, Abschrift scripts, installers.
+session check, cells, search_files fix, Abschrift scripts, installers; in
+0.10.0-ma.4: the parts taken from upstream jcode.py of 2026-10-22.
 
 Run from the repository root:  python3 tests/mutation_check.py [-j N]
 Needs pytest, git and bubblewrap (pwsh for the Windows mutations); no
@@ -74,10 +75,9 @@ MUTATIONS = [
      "if _GIT_CONFIG_GROUP.match(name):", "if False:"),
     # ------------------------------------------------ search_files / list_files
     ("search_files follows '..' in glob", "jcode.py",
-     'if ".." in Path(glob).parts:', "if False:"),
+     'if Path(glob).is_absolute() or ".." in Path(glob).parts:', "if False:"),
     ("search_files follows symlinks out of code/", "jcode.py",
-     "        if not _inside_sandbox(p):\n            continue\n        try:",
-     "        try:"),
+     "if not p.is_file() or not _inside_sandbox(p):", "if not p.is_file():"),
     ("list_files shows symlinks out of code/", "jcode.py",
      "        if not _inside_sandbox(p):  # FORK (security): no peeking through symlinks\n            continue\n",
      ""),
@@ -180,6 +180,57 @@ MUTATIONS = [
      '    if ($changes) { Stop-Install "$Repo has local changes (nothing copied):`n$changes" }', ""),
     ("install_ma3.ps1 drops the hooks' executable bit", "vm/windows/install_ma3.ps1",
      '            Invoke-Git $Repo @("update-index", "--chmod=+x", "--", $file) | Out-Null', ""),
+    # ------------------------------------------------ ma.4: upstream 2026-10-22 parts
+    ("ma.4 no pipefail", "jcode.py",
+     'command = "set -o pipefail; " + command', "command = command"),
+    ("ma.4 dash instead of bash", "jcode.py",
+     '_SHELL = shutil.which("bash") if os.name != "nt" else None', "_SHELL = None"),
+    ("ma.4 timeout kills only the shell", "jcode.py",
+     'os.killpg(proc.pid, signal.SIGKILL) if os.name != "nt" else proc.kill()', "proc.kill()"),
+    ("ma.4 no own process group", "jcode.py",
+     "start_new_session=True,  # own process group", "start_new_session=False,  # own process group"),
+    ("ma.4 timeout drops partial output", "jcode.py",
+     "stdout, stderr = proc.communicate()  # partial output", 'stdout, stderr = "", ""  # partial output'),
+    ("ma.4 pip path unquoted", "jcode.py",
+     'lambda _: f"{shlex.quote(sys.executable)} -m pip"', 'lambda _: f"{sys.executable} -m pip"'),
+    ("ma.4 loop guard off", "jcode.py",
+     "repeats = repeats + 1 if call in recent_calls else 0", "repeats = 0"),
+    ("ma.4 loop guard never stops", "jcode.py",
+     "                if not nudged:  # first time", "                if True:  # first time"),
+    ("ma.4 failure streak off", "jcode.py",
+     "fail_streak = fail_streak + 1 if (key and key == fail_key) else (1 if key else 0)",
+     "fail_streak = 0"),
+    ("ma.4 errors not masked", "jcode.py",
+     "    masked = re.sub(r\"'[^']*'|", "    masked = first or re.sub(r\"'[^']*'|"),
+    ("ma.4 4xx retried", "jcode.py",
+     "if status and 400 <= status < 500 and status not in (408, 409, 429):", "if False:"),
+    ("ma.4 images not stripped", "jcode.py",
+     "if _has_images(messages) and not rejected_once:", "if False:"),
+    ("ma.4 no compaction on context error", "jcode.py",
+     'if "context" in err and not rejected_once:', "if False:"),
+    ("ma.4 read_file ignores the range", "jcode.py",
+     "    sel = lines[lo - 1:hi]", "    sel = lines"),
+    ("ma.4 binary file not named", "jcode.py",
+     "is a binary file ({p.stat().st_size} bytes)", "could not be read"),
+    ("ma.4 node_modules listed", "jcode.py",
+     'SKIP_DIRS = {"node_modules", ".git",', 'SKIP_DIRS = {".git",'),
+    ("ma.4 list not capped", "jcode.py", "MAX_LIST = 300", "MAX_LIST = 10**9"),
+    ("ma.4 search ignores skipped folders", "jcode.py",
+     "if (set(p.relative_to(SANDBOX).parts[:-1]) & SKIP_DIRS) - named:", "if False:"),
+    ("ma.4 absolute glob allowed", "jcode.py",
+     'if Path(glob).is_absolute() or ".." in Path(glob).parts:', 'if ".." in Path(glob).parts:'),
+    ("ma.4 garbled path not re-rooted", "jcode.py",
+     "elif not _inside(p.resolve(), SANDBOX) and _garbled_sandbox_tail(parts) is not None:",
+     "elif False:"),
+    ("ma.4 resolve accepts outside paths", "jcode.py",
+     "    if _inside(p, SANDBOX):\n        return p\n    where", "    if True:\n        return p\n    where"),
+    ("ma.4 no-op write reported as success", "jcode.py", "    if old == content:", "    if False:"),
+    ("ma.4 identical edit accepted", "jcode.py",
+     "    if old_string == new_string:  # upstream", "    if False:  # upstream"),
+    ("ma.4 stats line missing", "jcode.py",
+     "        print(_stats_line(usage, msg, elapsed))", "        pass"),
+    ("ma.4 builder told to pip install again", "jcode.py",
+     "report it in the summary; never install anything.", "install it via 'pip install <package>'."),
 ]
 
 

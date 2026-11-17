@@ -421,3 +421,92 @@ def test_session_red_when_a_helper_prints_nothing(vm_layout, tmp_path: Path) -> 
     result = run_script("session_check.sh", "--quick", env=env)
     assert result.returncode == 1
     assert "the check printed nothing" in result.stdout
+
+
+# ---------------------------------------------------- ma.4: browser libraries
+DRY_RUN_MISSING = "Missing system dependencies (2):\n  libgtk-4-1\n  libwoff1\n"
+DRY_RUN_NONE = "All system dependencies are installed.\n"
+
+
+def run_install_browsers(tmp_path: Path, dry_run_output: str):
+    """install_browsers with stub 'python' and 'sudo' that record what they get.
+
+    The stub sudo records its arguments and whether stdin is a terminal-less
+    /dev/null (ma.4: apt-get started with the terminal stopped in state T)."""
+    stubs = tmp_path / "stubs"
+    stubs.mkdir()
+    record = tmp_path / "record.txt"
+    (stubs / "python").write_text(
+        "#!/bin/sh\n"
+        f'echo "python $*" >> "{record}"\n'
+        'case "$*" in *--dry-run*) printf "%s" "$DRY_RUN"; exit 1;; esac\n'
+    )
+    (stubs / "sudo").write_text(
+        "#!/bin/sh\n"
+        f'echo "sudo stdin=$(readlink /proc/self/fd/0) $*" >> "{record}"\n'
+    )
+    for stub in stubs.iterdir():
+        stub.chmod(0o755)
+    result = subprocess.run(
+        ["bash", "-c", f'source "{VM_DIR / "setup_vm.sh"}" && install_browsers'],
+        check=False, capture_output=True, text=True, timeout=60,
+        env={**os.environ, "PATH": f"{stubs}{os.pathsep}{os.environ['PATH']}",
+             "DRY_RUN": dry_run_output},
+    )
+    return result, record.read_text().splitlines()
+
+
+def test_browser_libraries_use_our_apt_get_without_terminal(tmp_path: Path) -> None:
+    """Playwright only lists the packages; apt-get is ours, with stdin = /dev/null."""
+    result, calls = run_install_browsers(tmp_path, DRY_RUN_MISSING)
+    assert result.returncode == 0, result.stderr
+    sudo_calls = [c for c in calls if c.startswith("sudo")]
+    assert sudo_calls == ["sudo stdin=/dev/null env DEBIAN_FRONTEND=noninteractive apt-get "
+                          "install -y --no-install-recommends libgtk-4-1 libwoff1"]
+    assert not any("install-deps chromium" in c and "--dry-run" not in c for c in calls)
+    assert calls[-1] == "python -m playwright install chromium firefox webkit"
+
+
+def test_browser_libraries_skipped_when_nothing_is_missing(tmp_path: Path) -> None:
+    result, calls = run_install_browsers(tmp_path, DRY_RUN_NONE)
+    assert result.returncode == 0, result.stderr
+    assert not any(c.startswith("sudo") for c in calls)
+    assert "No missing system libraries" in result.stdout
+
+
+def test_final_message_does_not_ask_for_a_snapshot_before_the_guide_says_so() -> None:
+    """2026-10-22: the old message sent Fran to shut down and snapshot before A4-A6."""
+    text = (VM_DIR / "setup_vm.sh").read_text()
+    assert "shut the VM down" not in text and "session_check.sh says GREEN" in text
+
+
+def test_every_apt_get_in_the_installers_runs_without_terminal() -> None:
+    """Each apt-get line of setup_vm.sh and install_ma3.sh reads /dev/null."""
+    for script in ("setup_vm.sh", "install_ma3.sh"):
+        for line in (VM_DIR / script).read_text().splitlines():
+            code = line.split("#", 1)[0]
+            if "apt-get" in code and "sudo" in code and not code.strip().startswith("echo"):
+                assert "</dev/null" in code, f"{script}: {line.strip()}"
+
+
+# ------------------------------------------------- ma.4: X server without cookie
+def test_session_says_why_x_accepts_programs_without_cookie(vm_layout, tmp_path: Path) -> None:
+    """The xhost-local script back after an update, or a SI:localuser rule: a
+    warning that names the cause (the cell check only sees the effect)."""
+    script = tmp_path / "35x11-common_xhost-local"
+    script.write_text("xhost +SI:localuser:$(id -un)\n")
+    stubs = tmp_path / "xhost-stub"
+    stubs.mkdir()
+    (stubs / "xhost").write_text("#!/bin/sh\necho 'access control enabled'\necho 'SI:localuser:fran'\n")
+    (stubs / "xhost").chmod(0o755)
+    env = {**vm_layout, "XHOST_LOCAL_SCRIPT": str(script), "DISPLAY": ":0",
+           "PATH": f"{stubs}{os.pathsep}{vm_layout['PATH']}"}
+    result = run_script("session_check.sh", "--quick", env=env)
+    assert f"{script} is back" in result.stdout
+    assert "xhost -SI:localuser:" in result.stdout
+
+
+def test_session_ok_when_x_needs_a_cookie(vm_layout, tmp_path: Path) -> None:
+    env = {**vm_layout, "XHOST_LOCAL_SCRIPT": str(tmp_path / "diverted"), "DISPLAY": ""}
+    result = run_script("session_check.sh", "--quick", env=env)
+    assert "X server: no access without cookie" in result.stdout
